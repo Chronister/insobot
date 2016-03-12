@@ -28,21 +28,73 @@ const IRCModuleCtx irc_mod_ctx = {
 
 static const IRCCoreCtx* ctx;
 
+enum {
+    AP_NORMAL = 0,
+    AP_WHITELISTED,
+    AP_ADMINONLY,
+       
+    AP_COUNT,
+};
+
+char* alias_permission_strs[] = {
+    "NORMAL",
+    "WLIST",
+    "ADMIN",
+};
+
+typedef struct {
+    int permission;
+    char* msg;
+} Alias;
+
 //TODO: aliases should be per-channel
 static char** alias_keys;
-static char** alias_vals;
+static Alias* alias_vals;
+
+static void alias_add(char* key, char* msg, int perm) {
+    fprintf(stderr, "Got alias: [%s] = [%s] (Access level %s)\n", key, msg, alias_permission_strs[perm]);
+    //TODO(chronister): Allocate this dynamically, so that alias_vals can be an array of pointers
+    // and we end up with multiple keys going to actually the same values
+    Alias value = {
+        .permission = perm,
+        .msg        = msg,
+    };
+    sb_push(alias_keys, key);
+    sb_push(alias_vals, value);
+}
 
 static bool alias_init(const IRCCoreCtx* _ctx){
 	ctx = _ctx;
 	FILE* f = fopen(ctx->get_datafile(), "rb");
 
-	char *key, *val;
+	char *key, *msg, *permstr;
+    int perm = AP_NORMAL;
 
-	while(fscanf(f, "%ms %m[^\n]", &key, &val) == 2){
-		fprintf(stderr, "Got alias: [%s] = [%s]\n", key, val);
-		sb_push(alias_keys, key);
-		sb_push(alias_vals, val);
-	}
+    bool got_alias = false;
+	do {
+        size_t fptr = ftell(f);
+        // Alias format: [PERM] KEY VALUE
+        // Bot saves PERM automatically now so it should only find two-argument aliases
+        // in files saved before this module added permissions
+        got_alias = fscanf(f, "%ms %ms %m[^\n]", &permstr, &key, &msg) == 3;
+        if (got_alias) {
+            if      (strcmp(permstr, alias_permission_strs[AP_NORMAL]) == 0)        perm = AP_NORMAL;
+            else if (strcmp(permstr, alias_permission_strs[AP_WHITELISTED]) == 0)   perm = AP_WHITELISTED;
+            else if (strcmp(permstr, alias_permission_strs[AP_ADMINONLY]) == 0)     perm = AP_ADMINONLY;
+            // Unknown prefix, assume "prefix" is actually the key of an old-style alias declaration
+            else got_alias = false;
+        }
+        if (!got_alias) {
+            // Try again looking for an old-style declaration this time
+            fseek(f, fptr, SEEK_SET);
+            got_alias = fscanf(f, "%ms %m[^\n]", &key, &msg) == 2;
+            perm = AP_NORMAL;
+        }
+
+        if (got_alias) {
+            alias_add(key, msg, perm);
+        }
+	} while(got_alias);
 		
 	return true;
 }
@@ -72,15 +124,14 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 			bool found = false;
 			for(int i = 0; i < sb_count(alias_keys); ++i){
 				if(strcmp(key, alias_keys[i]) == 0){
-					free(alias_vals[i]);
-					alias_vals[i] = strdup(space+1);
+					free(alias_vals[i].msg);
+					alias_vals[i].msg = strdup(space+1);
 					found = true;
 				}
 			}
 
 			if(!found){
-				sb_push(alias_keys, strdup(key));
-				sb_push(alias_vals, strdup(space+1));
+                alias_add(strdup(key), strdup(space+1), AP_NORMAL);
 			}
 
 			ctx->send_msg(chan, "%s: Alias %s set.", name, key);
@@ -97,7 +148,7 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 					free(alias_keys[i]);
 					sb_erase(alias_keys, i);
 					
-					free(alias_vals[i]);
+					free(alias_vals[i].msg);
 					sb_erase(alias_vals, i);
 
 					ctx->send_msg(chan, "%s: Removed alias %s.\n", name, arg);
@@ -170,7 +221,21 @@ static void alias_msg(const char* chan, const char* name, const char* msg){
 	size_t name_len = strlen(name);
 	char* msg_buf = NULL;
 
-	for(const char* str = alias_vals[index]; *str; ++str){
+    Alias value = alias_vals[index];
+	bool has_cmd_perms = (value.permission == AP_NORMAL) || strcasecmp(chan+1, name) == 0;
+	if(!has_cmd_perms){
+        if (value.permission == AP_WHITELISTED)
+            MOD_MSG(ctx, "check_whitelist", name, &whitelist_cb, &has_cmd_perms);
+        else if (value.permission == AP_ADMINONLY)
+            MOD_MSG(ctx, "check_admin", name, &whitelist_cb, &has_cmd_perms);
+        else {
+            // Some kind of weird unknown permission type. Assume normal access.
+            has_cmd_perms = true;
+        }
+	}
+	if(!has_cmd_perms) return;
+
+	for(const char* str = value.msg; *str; ++str){
 		if(*str == '%' && *(str + 1) == 't'){
 			memcpy(sb_add(msg_buf, name_len), name, name_len);
 			++str;
@@ -199,7 +264,11 @@ static void alias_msg(const char* chan, const char* name, const char* msg){
 
 static bool alias_save(FILE* file){
 	for(int i = 0; i < sb_count(alias_keys); ++i){
-		fprintf(file, "%s\t%s\n", alias_keys[i], alias_vals[i]);
+        bool perm_valid = (alias_vals[i].permission >= 0 && alias_vals[i].permission <= AP_COUNT);
+        if (perm_valid) {
+            fprintf(file, "%s\t", alias_permission_strs[alias_vals[i].permission]);
+        }
+        fprintf(file, "%s\t%s\n", alias_keys[i], alias_vals[i].msg);
 	}
 	return true;
 }
