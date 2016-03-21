@@ -6,6 +6,7 @@
 #include <string.h>
 #include <assert.h>
 #include "stb_sb.h"
+#include "utils.h"
 
 static void linkinfo_msg  (const char*, const char*, const char*);
 static bool linkinfo_init (const IRCCoreCtx*);
@@ -22,12 +23,15 @@ static const IRCCoreCtx* ctx;
 
 static regex_t yt_url_regex;
 static regex_t yt_title_regex;
+static regex_t yt_length_regex;
 
 static regex_t msdn_url_regex;
 static regex_t generic_title_regex;
 
 static regex_t twitter_url_regex;
 static const char* twitter_token;
+
+static regex_t steam_url_regex;
 
 static bool linkinfo_init(const IRCCoreCtx* _ctx){
 	ctx = _ctx;
@@ -43,6 +47,12 @@ static bool linkinfo_init(const IRCCoreCtx* _ctx){
 	ret = ret & (regcomp(
 		&yt_title_regex,
 		"title=([^&]*)",
+		REG_EXTENDED | REG_ICASE
+	) == 0);
+
+	ret = ret & (regcomp(
+		&yt_length_regex,
+		"length_seconds=([0-9]+)",
 		REG_EXTENDED | REG_ICASE
 	) == 0);
 
@@ -64,21 +74,18 @@ static bool linkinfo_init(const IRCCoreCtx* _ctx){
 		REG_EXTENDED | REG_ICASE
 	) == 0);
 
+	ret = ret & (regcomp(
+		&steam_url_regex,
+		"store.steampowered.com/app/([0-9]+)",
+		REG_EXTENDED | REG_ICASE
+	) == 0);
+
 	twitter_token = getenv("INSOBOT_TWITTER_TOKEN");
 	if(!twitter_token || !*twitter_token){
 		fputs("mod_linkinfo: no twitter token, expanding tweets won't work.\n", stderr);
 	}
 
 	return ret;
-}
-
-static size_t curl_callback(char* ptr, size_t sz, size_t nmemb, void* data){
-	char** out = (char**)data;
-	const size_t total = sz * nmemb;
-
-	memcpy(sb_add(*out, total), ptr, total);
-
-	return total;
 }
 
 static void do_youtube_info(const char* chan, const char* msg, regmatch_t* matches){
@@ -105,25 +112,16 @@ static void do_youtube_info(const char* chan, const char* msg, regmatch_t* match
 
 	fprintf(stderr, "linkinfo: Fetching [%s]\n", url);
 
-	CURL* curl = curl_easy_init();
-
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
-	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
-	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "insobot");
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
-
-	regmatch_t title[2];
-
+	CURL* curl = inso_curl_init(url, &data);
 	CURLcode result = curl_easy_perform(curl);
-
 	sb_push(data, 0);
+
+	regmatch_t title[2], length[2];
 
 	if(
 		result == 0 &&
 		regexec(&yt_title_regex, data, 2, title, 0) == 0 &&
+		regexec(&yt_length_regex, data, 2, length, 0) == 0 &&
 		title[1].rm_so != -1 &&
 		title[1].rm_eo != -1
 	){
@@ -139,12 +137,27 @@ static void do_youtube_info(const char* chan, const char* msg, regmatch_t* match
 			if(!str[i]) str[i] = ' ';
 		}
 
-		ctx->send_msg(chan, "↑ YT Video: [%.*s]", outlen, str);
+		enum { SEC_IN_HOUR = (60*60), SEC_IN_MIN = 60 };
+
+		char length_str[32] = {};
+		char* ls_ptr = length_str;
+		size_t ls_sz = sizeof(length_str);
+
+		int secs = strtoul(data + length[1].rm_so, NULL, 10);
+		if(secs > SEC_IN_HOUR){
+			snprintf_chain(&ls_ptr, &ls_sz, "%d:", secs / SEC_IN_HOUR);
+			secs %= SEC_IN_HOUR;
+		}
+		snprintf_chain(&ls_ptr, &ls_sz, "%02d:", secs / SEC_IN_MIN);
+		snprintf_chain(&ls_ptr, &ls_sz, "%02d", secs % SEC_IN_MIN);
+
+		ctx->send_msg(chan, "↑ YT Video: [%.*s] [%s]", outlen, str, length_str);
 
 		curl_free(str);
 	} else {
 		fprintf(stderr, "linkinfo: curl returned %d: %s\n", result, curl_easy_strerror(result));
 		fprintf(stderr, "data_len = %zu, so:%d eo:%d\n", strlen(data), title[1].rm_so, title[1].rm_eo);
+		ctx->send_msg(chan, "Error getting YT data. Blame insofaras.");
 	}
 
 	curl_easy_cleanup(curl);
@@ -167,20 +180,12 @@ void do_generic_info(const char* chan, const char* msg, regmatch_t* matches, con
 
 	fprintf(stderr, "linkinfo: Fetching [%s]\n", url);
 
-	CURL* curl = curl_easy_init();
 
 	/* if you get curl SSL Connect errors here for some reason, it seems like a bug in 
 	 * the gnutls version of curl, using the openssl version fixed it for me
 	 */
 
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
-	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
-	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8);
-
+	CURL* curl = inso_curl_init(url, &data);
 	CURLcode curl_ret = curl_easy_perform(curl);
 
 	sb_push(data, 0);
@@ -196,6 +201,7 @@ void do_generic_info(const char* chan, const char* msg, regmatch_t* matches, con
 		ctx->send_msg(chan, "↑ %s: [%.*s]", tag, title_len, data + title[1].rm_so);
 	} else {
 		fprintf(stderr, "linkinfo: Couldn't extract title\n[%s]\n[%s]", curl_easy_strerror(curl_ret), data);
+		ctx->send_msg(chan, "Error getting %s data. Blame insofaras.", tag);
 	}
 
 	curl_easy_cleanup(curl);
@@ -243,6 +249,14 @@ static int twitter_add_url_replacements(Replacement** out, yajl_val urls, const 
 
 		if(!tco_url || !exp_url) continue;
 
+		//XXX: better image url hack
+		if(strcmp(*exp_url_path, "media_url_https") == 0){
+			char* better_url;
+			asprintf(&better_url, "%s:orig", exp_url->u.string);
+			free(exp_url->u.string);
+			exp_url->u.string = better_url;
+		}
+
 		Replacement ur = {
 			.from     = tco_url->u.string,
 			.from_len = strlen(tco_url->u.string),
@@ -274,18 +288,10 @@ static void do_twitter_info(const char* chan, const char* msg, regmatch_t* match
 	asprintf(&auth_token, "Authorization: Bearer %s", twitter_token);
 	asprintf(&url, "https://api.twitter.com/1.1/statuses/show/%s.json", tweet_id);
 
-	CURL* curl = curl_easy_init();
+	CURL* curl = inso_curl_init(url, &data);
 
 	struct curl_slist* headers = curl_slist_append(NULL, auth_token);
-
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
-	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
-	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "insobot");
-	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
 
 	curl_easy_perform(curl);
 
@@ -368,6 +374,72 @@ out:
 	sb_free(data);
 }
 
+static void do_steam_info(const char* chan, const char* msg, regmatch_t* matches){
+	const char* appid = strndupa(msg + matches[1].rm_so, matches[1].rm_eo - matches[1].rm_so);
+
+	char* url;
+	asprintf(&url, "http://store.steampowered.com/api/appdetails?appids=%s&cc=US", appid);
+
+	char* data = NULL;
+	yajl_val root = NULL;
+
+	CURL* curl = inso_curl_init(url, &data);
+	CURLcode ret = curl_easy_perform(curl);
+	curl_easy_cleanup(curl);
+
+	free(url);
+
+	if(ret != 0){
+		fprintf(stderr, "mod_linkinfo: steam curl err %s\n", curl_easy_strerror(ret));
+		goto out;
+	}
+
+	sb_push(data, 0);
+
+	root = yajl_tree_parse(data, NULL, 0);
+	if(!root){
+		fprintf(stderr, "mod_linkinfo: steam root null!\n");
+		goto out;
+	}
+
+	const char* title_path[] = { appid, "data", "name", NULL };
+	const char* price_path[] = { appid, "data", "price_overview", "final", NULL };
+	const char* plats_path[] = { appid, "data", "platforms", NULL };
+
+	yajl_val title = yajl_tree_get(root, title_path, yajl_t_string);
+	yajl_val price = yajl_tree_get(root, price_path, yajl_t_number);
+	yajl_val plats = yajl_tree_get(root, plats_path, yajl_t_object);
+
+	if(!title || !price || !plats){
+		fprintf(stderr, "mod_linkinfo: steam title/price/plats null!\n");
+		goto out;
+	}
+
+	char plat_str[16] = {};
+	for(int i = 0; i < plats->u.object.len; ++i){
+		if(!plats->u.object.values[i] || plats->u.object.values[i]->type != yajl_t_true){
+			continue;
+		}
+
+		const char* tag = NULL;
+		if(*plat_str) inso_strcat(plat_str, sizeof(plat_str), "/");
+
+		if(strcmp(plats->u.object.keys[i], "linux"  ) == 0) tag = "LNX";
+		if(strcmp(plats->u.object.keys[i], "mac"    ) == 0) tag = "MAC";
+		if(strcmp(plats->u.object.keys[i], "windows") == 0) tag = "WIN";
+
+		if(tag)	inso_strcat(plat_str, sizeof(plat_str), tag);
+	}
+
+	int price_hi = price->u.number.i / 100, price_lo = price->u.number.i % 100;
+
+	ctx->send_msg(chan, "↑ Steam: [%s] [%s] [$%d.%02d]", title->u.string, plat_str, price_hi, price_lo);
+
+out:
+	if(data) sb_free(data);
+	if(root) yajl_tree_free(root);
+}
+
 static void linkinfo_msg(const char* chan, const char* name, const char* msg){
 
 	regmatch_t matches[5] = {};
@@ -382,5 +454,9 @@ static void linkinfo_msg(const char* chan, const char* name, const char* msg){
 
 	if(regexec(&twitter_url_regex, msg, 2, matches, 0) == 0){
 		do_twitter_info(chan, msg, matches);
+	}
+
+	if(regexec(&steam_url_regex, msg, 2, matches, 0) == 0){
+		do_steam_info(chan, msg, matches);
 	}
 }

@@ -97,6 +97,7 @@ static void alias_load(FILE* f){
 
 			if(fscanf(f, " %m[^\n]", &token) == 1){
 				val.msg = token;
+				val.me_action = (strstr(token, "/me") == token);
 				sb_push(alias_keys, keys);
 				sb_push(alias_vals, val);
 				fprintf(stderr, "Loaded alias [%s] = [%s]\n", *keys, val.msg);
@@ -148,6 +149,7 @@ static void alias_add(const char* key, const char* msg, int perm){
 
 	if(alias_find(key, &idx, NULL)){
 		alias = alias_vals + idx;
+		free(alias->msg);
 	} else {
 		char** keys = NULL;
 		Alias a = {};
@@ -157,10 +159,6 @@ static void alias_add(const char* key, const char* msg, int perm){
 		sb_push(alias_vals, a);
 
 		alias = &sb_last(alias_vals);
-	}
-
-	if(alias->msg){
-		free(alias_vals[idx].msg);
 	}
 
 	alias->msg        = strdup(msg);
@@ -221,7 +219,6 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 					free(otherkey);
 				}
 			} else {
-				fprintf(stderr, "ADDING [%s]\n", space+1);
 				alias_add(key, space+1, AP_NORMAL);
 				ctx->send_msg(chan, "%s: Alias %s set.", name, key);
 			}
@@ -283,6 +280,7 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 				if(strcasecmp(permstr, alias_permission_strs[i]) == 0){
 					alias_vals[idx].permission = i;
 					ctx->send_msg(chan, "%s: Set permissions on %s to %s.", name, key, permstr);
+					perm_set = true;
 					break;
 				}
 			}
@@ -309,8 +307,9 @@ static void alias_msg(const char* chan, const char* name, const char* msg){
 
 	if(*msg != '!') return;
 
+	const char* key = strndupa(msg+1, strchrnul(msg, ' ') - (msg+1));
 	int idx, sub_idx;
-	if(!alias_find(msg + 1, &idx, &sub_idx)){
+	if(!alias_find(key, &idx, &sub_idx)){
 		return;
 	}
 
