@@ -19,7 +19,7 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_init  = &hmh_init,
 	.commands = DEFINE_CMDS (
 		[CMD_SCHEDULE] = CONTROL_CHAR "sched " CONTROL_CHAR "schedule",
-		[CMD_TIME]     = CONTROL_CHAR "tm "    CONTROL_CHAR "time"
+		[CMD_TIME]     = CONTROL_CHAR "tm "    CONTROL_CHAR "time "     CONTROL_CHAR"timer"
 	)
 };
 
@@ -56,6 +56,7 @@ static bool update_schedule(void){
 	CURL* curl = inso_curl_init(schedule_url, &data);
 	curl_easy_setopt(curl, CURLOPT_TIMECONDITION, CURL_TIMECOND_IFMODSINCE);
 	curl_easy_setopt(curl, CURLOPT_TIMEVALUE, (long) last_schedule_update);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
 
 	int curl_ret = curl_easy_perform(curl);
 	long http_code = 0;

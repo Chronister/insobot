@@ -24,12 +24,12 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_save  = &quotes_save,
 	.commands = DEFINE_CMDS (
 		[GET_QUOTE]     = CONTROL_CHAR"q    "CONTROL_CHAR"quote",
-		[ADD_QUOTE]     = CONTROL_CHAR"qadd "CONTROL_CHAR"q+",
-		[DEL_QUOTE]     = CONTROL_CHAR"qdel "CONTROL_CHAR"q-",
-		[FIX_QUOTE]     = CONTROL_CHAR"qfix "CONTROL_CHAR"qmv",
-		[FIX_TIME]      = CONTROL_CHAR"qft  "CONTROL_CHAR"qfixtime",
+		[ADD_QUOTE]     = CONTROL_CHAR"qadd "CONTROL_CHAR"q+ " CONTROL_CHAR"addquote",
+		[DEL_QUOTE]     = CONTROL_CHAR"qdel "CONTROL_CHAR"q- " CONTROL_CHAR"delquote",
+		[FIX_QUOTE]     = CONTROL_CHAR"qfix "CONTROL_CHAR"qmv "      CONTROL_CHAR"fixquote",
+		[FIX_TIME]      = CONTROL_CHAR"qft  "CONTROL_CHAR"qfixtime " CONTROL_CHAR"fixquotetime",
 		[LIST_QUOTES]   = CONTROL_CHAR"ql   "CONTROL_CHAR"qlist",
-		[SEARCH_QUOTES] = CONTROL_CHAR"qs   "CONTROL_CHAR"qsearch " CONTROL_CHAR"qfind " CONTROL_CHAR"qgrep"
+		[SEARCH_QUOTES] = CONTROL_CHAR"qs   "CONTROL_CHAR"qsearch "  CONTROL_CHAR"qfind " CONTROL_CHAR"qgrep " CONTROL_CHAR"sq"
 	)
 };
 
