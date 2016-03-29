@@ -382,12 +382,8 @@ static void util_check_inotify(const IRCCoreCtx* core_ctx){
 			}
 		} else if(m->data_modified){
 			m->data_modified = false;
-			if(m->ctx && m->ctx->on_modified){
-				sb_push(mod_call_stack, m);
-				fprintf(stderr, "Calling on_data_modified for %s\n", m->ctx->name);
-				m->ctx->on_modified();
-				sb_pop(mod_call_stack);
-			}
+			fprintf(stderr, "Calling on_data_modified for %s\n", m->ctx->name);
+			IRC_MOD_CALL(m, on_modified, ());
 		}
 	}
 }
@@ -431,7 +427,17 @@ IRC_STR_CALLBACK(on_connect) {
 
 IRC_STR_CALLBACK(on_chat_msg) {
 	if(count < 2 || !params[0] || !params[1]) return;
-	const char *_chan = params[0], *_name = origin, *_msg = params[1];
+	const char *_chan = params[0], *_name = origin;
+
+	char* _msg = strdupa(params[1]);
+	size_t len = strlen(_msg);
+
+	// trim spaces at end of messages
+	if(len > 0){
+		for(char* p = _msg + len - 1; *p == ' '; --p){
+			*p = 0;
+		}
+	}
 
 	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
 		bool global = m->ctx->flags & IRC_MOD_GLOBAL;
@@ -672,12 +678,8 @@ static void core_send_raw(const char* raw){
 }
 
 static void core_send_mod_msg(IRCModMsg* msg){
-	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
-		const char* sender = sb_last(mod_call_stack)->ctx->name;
-		sb_push(mod_call_stack, m);
-		if(m->ctx->on_mod_msg) m->ctx->on_mod_msg(sender, msg);
-		sb_pop(mod_call_stack);
-	}
+	const char* sender = sb_last(mod_call_stack)->ctx->name;
+	IRC_MOD_CALL_ALL(on_mod_msg, (sender, msg));
 }
 
 static void core_self_save(void){
@@ -876,19 +878,14 @@ int main(int argc, char** argv){
 			util_check_inotify(&core_ctx);
 
 			//TODO: check on_meta & better timing for on_tick?
-			for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
-				if(m->ctx->on_tick){
-					sb_push(mod_call_stack, m);
-					m->ctx->on_tick();
-					sb_pop(mod_call_stack);
-				}
-			}
+			IRC_MOD_CALL_ALL(on_tick, ());
 
 			int max_fd = 0;
 			fd_set in, out;
 	
 			FD_ZERO(&in);
 			FD_ZERO(&out);
+			FD_SET(STDIN_FILENO, &in);
 
 			if(irc_add_select_descriptors(irc_ctx, &in, &out, &max_fd) != 0){
 				fprintf(stderr, "Error adding select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
@@ -921,7 +918,7 @@ int main(int argc, char** argv){
 				}
 #endif		
 			} else if(ret > 0){
-
+#if 0
 				int i;
 				for(i = 0; i <= max_fd; ++i){
 					if(FD_ISSET(i, &in)){
@@ -929,9 +926,18 @@ int main(int argc, char** argv){
 						break;
 					}
 				}
-			
+#endif
 				if(irc_process_select_descriptors(irc_ctx, &in, &out) != 0){
 					fprintf(stderr, "Error processing select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
+				}
+
+				if(FD_ISSET(STDIN_FILENO, &in)){
+					char stdin_buf[1024];
+					ssize_t n =  read(STDIN_FILENO, stdin_buf, sizeof(stdin_buf));
+					if(n > 0){
+						stdin_buf[n-1] = 0; // remove \n
+						IRC_MOD_CALL_ALL(on_stdin, (stdin_buf));
+					}
 				}
 			}
 		}

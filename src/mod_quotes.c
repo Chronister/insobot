@@ -14,7 +14,7 @@ static void quotes_join     (const char*, const char*);
 static void quotes_cmd      (const char*, const char*, const char*, int);
 static bool quotes_save     (FILE*);
 
-enum { GET_QUOTE, ADD_QUOTE, DEL_QUOTE, FIX_QUOTE, FIX_TIME, LIST_QUOTES, SEARCH_QUOTES	};
+enum { GET_QUOTE, ADD_QUOTE, DEL_QUOTE, FIX_QUOTE, FIX_TIME, LIST_QUOTES, SEARCH_QUOTES, GET_RANDOM };
 
 const IRCModuleCtx irc_mod_ctx = {
 	.name        = "quotes",
@@ -31,7 +31,8 @@ const IRCModuleCtx irc_mod_ctx = {
 		[FIX_QUOTE]     = CONTROL_CHAR"qfix "CONTROL_CHAR"qmv "      CONTROL_CHAR"fixquote",
 		[FIX_TIME]      = CONTROL_CHAR"qft  "CONTROL_CHAR"qfixtime " CONTROL_CHAR"fixquotetime",
 		[LIST_QUOTES]   = CONTROL_CHAR"ql   "CONTROL_CHAR"qlist",
-		[SEARCH_QUOTES] = CONTROL_CHAR"qs   "CONTROL_CHAR"qsearch "  CONTROL_CHAR"qfind " CONTROL_CHAR"qgrep " CONTROL_CHAR"sq"
+		[SEARCH_QUOTES] = CONTROL_CHAR"qs   "CONTROL_CHAR"qsearch "  CONTROL_CHAR"qfind " CONTROL_CHAR"qgrep " CONTROL_CHAR"sq",
+		[GET_RANDOM]    = CONTROL_CHAR "qr "   CONTROL_CHAR "qrand "   CONTROL_CHAR "qrandom " CONTROL_CHAR"rq"
 	)
 };
 
@@ -476,11 +477,11 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			Quote* last_found_q = NULL;
 			bool more_flag = false;
 
-			char msg_buf[256];
+			char msg_buf[128];
 			memcpy(msg_buf, msg_start, sizeof(msg_start));
 
 			char* buf_ptr = msg_buf + sizeof(msg_start) - 1;
-			size_t buf_len = 256 - (sizeof(msg_start) + sizeof(msg_end) - 1);
+			ssize_t buf_len = 128 - (sizeof(msg_start) + sizeof(msg_end) - 1);
 
 			for(; qlist < sb_end(*quotes); ++qlist){
 				if(strcasestr(qlist->text, arg) != NULL){
@@ -488,11 +489,10 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 					last_found_q = qlist;
 
 					int ret = snprintf(buf_ptr, buf_len, "%d, ", qlist->id);
-					if(ret > 0){
+					if(ret <= buf_len){
 						buf_ptr += ret;
 						buf_len -= ret;
-					}
-					if(buf_len <= 0){
+					} else {
 						more_flag = true;
 						break;
 					}
@@ -502,7 +502,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			if(found_count == 1){
 				Quote* q = last_found_q;
 				struct tm* date_tm = gmtime(&q->timestamp);
-				char date[256];
+				char date[32];
 				strftime(date, sizeof(date), "%F", date_tm);
 				ctx->send_msg(chan, "Quote %d: \"%s\" --%s %s", q->id, q->text, chan+1, date);
 			} else if(found_count > 1){
@@ -518,6 +518,26 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			}
 
 		} break;
+
+		//TODO: can probably be merged with GET_QUOTE?
+		case GET_RANDOM: {
+			if(!sb_count(*quotes)){
+				ctx->send_msg(chan, "%s: No quotes here :(", name);
+				break;
+			}
+
+			int id = rand() % sb_count(*quotes);
+
+			Quote* q = get_quote(chan, id);
+			if(q){
+				struct tm* date_tm = gmtime(&q->timestamp);
+				char date[256];
+				strftime(date, sizeof(date), "%F", date_tm);
+				ctx->send_msg(chan, "Quote %d: \"%s\" --%s %s", id, q->text, chan+1, date);
+			} else {
+				ctx->send_msg(chan, "%s: Can't find that quote.", name);
+			}
+		}
 	}
 }
 
