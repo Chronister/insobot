@@ -30,7 +30,7 @@ static bool search_init(const IRCCoreCtx* _ctx){
     ctx = _ctx;
 
     bool ret = true;
-    int reg_result = regcomp(&ddg_result_regex, "result__a.{1,10}href=\"([^\"]*)\"", REG_EXTENDED | REG_ICASE);
+    int reg_result = regcomp(&ddg_result_regex, "[^a]>\\s+<h2 class=\"result__title\">\\s+<a rel=\"nofollow\"\\s+class=\"result__a.{1,10}href=\"([^\"]*)\"", REG_EXTENDED | REG_ICASE);
     if (reg_result != 0) {
         ret = false;
         char errbuf[256];
