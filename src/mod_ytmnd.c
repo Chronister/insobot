@@ -62,35 +62,39 @@ static void print_who_is_the_person_now_dog(const char* chan)
 {
     char* people_str = NULL;
     int gender = 0;
-    for (int person_index = 0; 
-        person_index < sb_count(people_now_dogs); 
-        ++person_index) {
-        struct PersonNowDog person = people_now_dogs[person_index];
-        gender |= person.gender;
-        strcpy(sb_add(people_str, strlen(person.name)+1), person.name);
-        sb_pop(people_str);
-        strcpy(sb_add(people_str, 3), ", ");
-        sb_pop(people_str);
-    }
-    people_str[sb_count(people_str) - 2] = ':';
-    sb_push(people_str, '\0');
+    if (sb_count(people_now_dogs) > 0) {
+        for (int person_index = 0; 
+            person_index < sb_count(people_now_dogs); 
+            ++person_index) {
+            struct PersonNowDog person = people_now_dogs[person_index];
+            gender |= person.gender;
+            strcpy(sb_add(people_str, strlen(person.name)+1), person.name);
+            sb_pop(people_str);
+            strcpy(sb_add(people_str, 3), ", ");
+            sb_pop(people_str);
+        }
+        people_str[sb_count(people_str) - 2] = ':';
+        sb_push(people_str, '\0');
 
-    char* who_str;
-    char* dog_str;
-    if (sb_count(people_now_dogs) <= 1) {
-        if (gender == DOG_M) who_str = "man";
-        else if (gender == DOG_F) who_str = "woman";   
-        else who_str = "person";
-        dog_str = "dog";
-    }
-    else {
-        if (gender == DOG_M) who_str = "men";
-        else if (gender == DOG_F) who_str = "women";   
-        else who_str = "people";
-        dog_str = "dogs";
-    }
+        char* who_str;
+        char* dog_str;
+        if (sb_count(people_now_dogs) <= 1) {
+            if (gender == DOG_M) who_str = "man";
+            else if (gender == DOG_F) who_str = "woman";   
+            else who_str = "person";
+            dog_str = "dog";
+        }
+        else {
+            if (gender == DOG_M) who_str = "men";
+            else if (gender == DOG_F) who_str = "women";   
+            else who_str = "people";
+            dog_str = "dogs";
+        }
 
-    ctx->send_msg(chan, "%sYou're the %s now, %s!", people_str, who_str, dog_str);
+        ctx->send_msg(chan, "%sYou're the %s now, %s!", people_str, who_str, dog_str);
+    } else {
+        ctx->send_msg(chan, "No one is the man now, dog :(");
+    }
 }
 
 static void ytmnd_cmd(const char* chan, const char* name, const char* msg, int cmd)

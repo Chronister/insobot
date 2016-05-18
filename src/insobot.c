@@ -17,8 +17,10 @@
 #include <limits.h>
 #include <glob.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <libircclient.h>
 #include <libirc_rfcnumeric.h>
+#include <curl/curl.h>
 #include "config.h"
 #include "module.h"
 #include "stb_sb.h"
@@ -116,6 +118,40 @@ static const char* core_get_datafile(void);
 /****************
  * Helper funcs *
  ****************/
+
+static void* util_log_thread_main(void* _arg){
+	int* fds = _arg;
+	int orig_stdout = fds[0];
+	int pipe_fd = fds[1];
+
+	char time_buf[64];
+	char c;
+
+	bool do_time = true;
+
+	while(true){
+		do {
+			ssize_t result = read(pipe_fd, &c, 1);
+			if(result <= 0){
+				dprintf(orig_stdout, "read: %s\n", strerror(errno));
+				continue;
+			}
+
+			if(do_time){
+				time_t now = time(0);
+				size_t time_size = strftime(time_buf, sizeof(time_buf), "[%F %T] ", localtime(&now));
+				write(orig_stdout, time_buf, time_size);
+				do_time = false;
+			}
+
+			write(orig_stdout, &c, 1);
+		} while(c != '\n');
+
+		do_time = true;
+	}
+
+	return NULL;
+}
 
 static void util_handle_sig(int n){
 	running = 0;
@@ -552,10 +588,11 @@ IRC_NUM_CALLBACK(on_numeric) {
 		
 		free(names);
 	} else {
-		printf(". . . Numeric [%u]\n", event);
+		printf(":: [%u]", event);
 		for(int i = 0; i < count; ++i){
-			printf(". . %s\n", params[i]);
+			printf(" :: %s", params[i]);
 		}
+		puts("");
 	}
 }
 
@@ -688,13 +725,16 @@ static void core_self_save(void){
 }
 
 static void core_log(const char* fmt, ...){
-	char time_buf[64];
-	time_t now = time(0);
-	struct tm* now_tm = localtime(&now);
-	strftime(time_buf, sizeof(time_buf), "[%F][%T]", now_tm);
 
-	const char* mod_name = sb_count(mod_call_stack) ? sb_last(mod_call_stack)->ctx->name : "CORE";
-	fprintf(stderr, "%s %s: ", time_buf, mod_name);
+	if(getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
+		char time_buf[64];
+		time_t now = time(0);
+		struct tm* now_tm = localtime(&now);
+		strftime(time_buf, sizeof(time_buf), "[%F][%T]", now_tm);
+
+		const char* mod_name = sb_count(mod_call_stack) ? sb_last(mod_call_stack)->ctx->name : "CORE";
+		fprintf(stderr, "%s %s: ", time_buf, mod_name);
+	}
 
 	va_list v;
 	va_start(v, fmt);
@@ -710,15 +750,29 @@ int main(int argc, char** argv){
 
 	srand(time(0));
 	signal(SIGINT, &util_handle_sig);
+
+	pthread_t log_thread;
 	
+	if(!getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
+		int fds[3] = { dup(STDOUT_FILENO) };
+
+		pipe(fds + 1);
+		dup2(fds[2], STDOUT_FILENO);
+		dup2(fds[2], STDERR_FILENO);
+
+		setlinebuf(stdout);
+		setlinebuf(stderr);
+
+		pthread_create(&log_thread, NULL, &util_log_thread_main, fds);
+	}
+
 	user = util_env_else("IRC_USER", DEFAULT_BOT_NAME);
 	pass = util_env_else("IRC_PASS", NULL);
 	serv = util_env_else("IRC_SERV", "irc.nonexistent.domain");
 	port = util_env_else("IRC_PORT", "6667");
 	bot_nick = strdup(user);
 
-	char our_path[PATH_MAX];
-	memset(our_path, 0, sizeof(our_path));
+	char our_path[PATH_MAX] = {};
 
 	ssize_t sz = readlink("/proc/self/exe", our_path, sizeof(our_path));
 	if(sz < 0){
@@ -784,6 +838,8 @@ int main(int argc, char** argv){
 			case GLOB_NOMATCH: errx(1, "No modules found!");   break;
 		}
 	}
+
+	curl_global_init(CURL_GLOBAL_ALL);
 
 	const IRCCoreCtx core_ctx = {
 		.get_username = &core_get_username,
@@ -861,6 +917,7 @@ int main(int argc, char** argv){
 		.event_numeric = irc_on_numeric,
 		.event_unknown = irc_on_unknown,
 	};
+
 
 	do {
 		irc_ctx = irc_create_session(&callbacks);
@@ -972,9 +1029,42 @@ int main(int argc, char** argv){
 		}
 	} while(running);
 
+	// clean stuff up so real leaks are more obvious in valgrind
+
 	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
 		util_module_save(m);
+		IRC_MOD_CALL(m, on_quit, ());
+		free(m->lib_path);
+		dlclose(m->lib_handle);
 	}
-	
+
+	sb_free(irc_modules);
+	sb_free(chan_mod_list);
+	sb_free(global_mod_list);
+	sb_free(mod_call_stack);
+	sb_free(cmd_queue);
+
+	curl_global_cleanup();
+
+	for(size_t i = 0; i < sb_count(channels) - 1; ++i){
+		free(channels[i]);
+		for(size_t j = 0; j < sb_count(chan_nicks[i]); ++j){
+			free(chan_nicks[i][j]);
+		}
+		sb_free(chan_nicks[i]);
+	}
+	sb_free(channels);
+	sb_free(chan_nicks);
+
+	free(bot_nick);
+
+	free(inotify_info.module_path);
+	free(inotify_info.data_path);
+
+	if(!getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
+		pthread_cancel(log_thread);
+		pthread_join(log_thread, NULL);
+	}
+
 	return 0;
 }
