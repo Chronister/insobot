@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/inotify.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <signal.h>
 #include <unistd.h>
 #include <limits.h>
@@ -21,12 +23,19 @@
 #include <libircclient.h>
 #include <libirc_rfcnumeric.h>
 #include <curl/curl.h>
+#include <locale.h>
 #include "config.h"
 #include "module.h"
 #include "stb_sb.h"
+#include "utils.h"
 
 #ifndef LIBIRC_OPTION_SSL_NO_VERIFY
 	#define LIBIRC_OPTION_SSL_NO_VERIFY (1 << 3)
+#endif
+
+// XXX: hack for older gcc
+#if !defined(__GNUC__) || __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 9)
+	#define __auto_type intptr_t
 #endif
 
 /******************************
@@ -40,15 +49,27 @@ typedef struct Module_ {
 	bool needs_reload, data_modified;
 } Module;
 
-typedef struct INotifyInfo_ {
-	int fd, module_watch, data_watch;
-	char *module_path, *data_path;
-} INotifyInfo;
+typedef struct INotifyWatch {
+	int wd;
+	char* path;
+} INotifyWatch;
+
+typedef struct INotifyData_ {
+	int fd;
+	INotifyWatch module, data, ipc;
+} INotifyData;
 
 typedef struct IRCCmd_ {
 	int cmd;
 	char *chan, *data;
 } IRCCmd;
+
+typedef struct IPCAddress_ {
+	int id;
+	struct sockaddr_un addr;
+} IPCAddress;
+
+enum { MOD_GET_SONAME, MOD_GET_CTXNAME };
 
 enum { IRC_CMD_JOIN, IRC_CMD_PART, IRC_CMD_MSG, IRC_CMD_RAW };
 
@@ -69,10 +90,14 @@ static char* bot_nick;
 static char**  channels;
 static char*** chan_nicks;
 
-static INotifyInfo inotify_info;
+static INotifyData inotify;
 
 static struct timeval idle_time = {};
 static int ping_sent;
+
+static int         ipc_socket;
+static IPCAddress  ipc_self;
+static IPCAddress* ipc_peers;
 
 static sig_atomic_t running = 1;
 
@@ -87,23 +112,31 @@ static sig_atomic_t running = 1;
 #define IRC_STR_CALLBACK(name) IRC_CALLBACK_BASE(name, const char*)
 #define IRC_NUM_CALLBACK(name) IRC_CALLBACK_BASE(name, unsigned int)
 
-#define IRC_MOD_CALL(mod, ptr, args) \
-	if((mod)->ctx->ptr){\
-		sb_push(mod_call_stack, (mod));\
-		(mod)->ctx->ptr args;\
-		sb_pop(mod_call_stack);\
+#define IRC_MOD_CALL(mod, ptr, args) ({                                       \
+	sb_push(mod_call_stack, mod);                                             \
+	__auto_type ret = (mod)->ctx->ptr ?                                       \
+		__builtin_choose_expr(                                                \
+			__builtin_types_compatible_p(typeof((mod)->ctx->ptr args), void), \
+			((mod)->ctx->ptr args, (int)0),                                   \
+			(mod)->ctx->ptr args                                              \
+		) : 0;                                                                \
+	sb_pop(mod_call_stack);                                                   \
+	ret;                                                                      \
+})
+
+#define IRC_MOD_CALL_ALL(ptr, args)                             \
+	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){ \
+		IRC_MOD_CALL(m, ptr, args);                             \
 	}
 
-#define IRC_MOD_CALL_ALL(ptr, args) \
-	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){\
-		IRC_MOD_CALL(m, ptr, args);\
-	}
-
-#define IRC_MOD_CALL_ALL_CHECK(ptr, args, id) \
-	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){\
-		if((m->ctx->flags & IRC_MOD_GLOBAL) || util_check_perms(m->ctx->name, params[0], id)){\
-			IRC_MOD_CALL(m, ptr, args);\
-		}\
+#define IRC_MOD_CALL_ALL_CHECK(ptr, args, id)                   \
+	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){ \
+		if(                                                     \
+			(m->ctx->flags & IRC_MOD_GLOBAL) ||                 \
+			util_check_perms(m->ctx->name, params[0], id)       \
+		){                                                      \
+			IRC_MOD_CALL(m, ptr, args);                         \
+		}                                                       \
 	}
 
 /*********************************
@@ -114,6 +147,8 @@ IRC_STR_CALLBACK(on_join);
 IRC_STR_CALLBACK(on_part);
 
 static const char* core_get_datafile(void);
+static IPCAddress* util_ipc_add(const char* name);
+static void        util_ipc_del(const char* name);
 
 /****************
  * Helper funcs *
@@ -140,11 +175,15 @@ static void* util_log_thread_main(void* _arg){
 			if(do_time){
 				time_t now = time(0);
 				size_t time_size = strftime(time_buf, sizeof(time_buf), "[%F %T] ", localtime(&now));
-				write(orig_stdout, time_buf, time_size);
+				if(write(orig_stdout, time_buf, time_size) == -1){
+					perror("log_thread write");
+				}
 				do_time = false;
 			}
 
-			write(orig_stdout, &c, 1);
+			if(write(orig_stdout, &c, 1) == -1){
+				perror("log_thread write");
+			}
 		} while(c != '\n');
 
 		do_time = true;
@@ -165,13 +204,8 @@ static inline const char* util_env_else(const char* env, const char* def){
 static bool util_check_perms(const char* mod, const char* chan, int id){
 	bool ret = true;
 	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
-		if(m->ctx->on_meta){
-			sb_push(mod_call_stack, m);
-			bool r = m->ctx->on_meta(mod, chan, id);
-			ret = ret & r;
-			//printf("checking %s:%s:%d --> %d\n", mod, chan, id, ret);
-			sb_pop(mod_call_stack);
-		}
+		if(!m->ctx->on_meta) continue;
+		ret &= IRC_MOD_CALL(m, on_meta, (mod, chan, id));
 	}
 	return ret;
 }
@@ -187,10 +221,7 @@ static void util_dispatch_cmds(Module* m, const char* chan, const char* name, co
 			const size_t sz = cmd_end - cmd;
 
 			if(strncasecmp(msg, cmd, sz) == 0 && (msg[sz] == ' ' || msg[sz] == '\0')){
-				sb_push(mod_call_stack, m);
-				m->ctx->on_cmd(chan, name, msg + sz, cmd_list - m->ctx->commands);
-				sb_pop(mod_call_stack);
-				return;
+				IRC_MOD_CALL(m, on_cmd, (chan, name, msg + sz, cmd_list - m->ctx->commands));
 			}
 
 			while(*cmd_end == ' ') ++cmd_end;
@@ -237,6 +268,7 @@ static void util_process_pending_cmds(void){
 
 			case IRC_CMD_MSG: {
 				irc_cmd_msg(irc_ctx, cmd.chan, cmd.data);
+				IRC_MOD_CALL_ALL(on_msg_out, (cmd.chan, cmd.data));
 			} break;
 
 			case IRC_CMD_RAW: {
@@ -250,18 +282,34 @@ static void util_process_pending_cmds(void){
 	}
 }
 
+static void util_module_add(const char* name){
+	char path_buf[PATH_MAX];
+	const char* path = name;
+
+	if(!strchr(path, '/')){
+		if(strlen(inotify.module.path) + strlen(name) + 1 > sizeof(path_buf)) return;
+
+		strcpy(path_buf, inotify.module.path);
+		strcat(path_buf, name);
+		path = path_buf;
+	}
+
+	Module m = {
+		.lib_path = strdup(path),
+		.needs_reload = true
+	};
+
+	sb_push(irc_modules, m);
+}
+
 static void util_module_save(Module* m){
 	if(!m->ctx || !m->ctx->on_save) return;
 
 	// change the inotify data watch to something we don't care about to disable it temporarily
-	inotify_info.data_watch = inotify_add_watch(
-		inotify_info.fd,
-		inotify_info.data_path,
-		IN_DELETE_SELF
-	);
+	inotify.data.wd = inotify_add_watch(inotify.fd, inotify.data.path, IN_DELETE_SELF);
 
 	sb_push(mod_call_stack, m);
-	
+
 	const char*  save_fname = core_get_datafile();
 	const size_t save_fsz   = strlen(save_fname);
 	const char   tmp_end[]  = ".XXXXXX";
@@ -287,146 +335,281 @@ static void util_module_save(Module* m){
 
 	sb_pop(mod_call_stack);
 
-	inotify_info.data_watch = inotify_add_watch(
-		inotify_info.fd,
-		inotify_info.data_path,
-		IN_CLOSE_WRITE | IN_MOVED_TO
-	);
+	inotify.data.wd = inotify_add_watch(inotify.fd, inotify.data.path, IN_CLOSE_WRITE | IN_MOVED_TO);
 }
 
-static void util_check_inotify(const IRCCoreCtx* core_ctx){
-	char buff[sizeof(struct inotify_event) + NAME_MAX + 1];
-	struct inotify_event* ev;
-	char* p = buff;
+static Module* util_module_get(const char* name, int type){
+	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
+		const char* base_path = basename(m->lib_path);
+		const char* comparison
+			= (type == MOD_GET_CTXNAME)	? m->ctx->name
+			: (type == MOD_GET_SONAME)  ? base_path
+			: NULL;
 
-	//TODO: clean this ugly function up & merge common code with the initial loading in main
+		if(strcmp(name, comparison) == 0){
+			return m;
+		}
+	}
+	return NULL;
+}
 
-	ssize_t sz = read(inotify_info.fd, &buff, sizeof(buff));
-	for(; (p - buff) < sz; p += (sizeof(*ev) + ev->len)){
-		ev = (struct inotify_event*)p;
+static int util_mod_sort(const void* a, const void* b){
+	return ((Module*)b)->ctx->priority - ((Module*)a)->ctx->priority;
+}
 
-		if(!(ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO))){
+static void util_reload_modules(const IRCCoreCtx* core_ctx){
+
+	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
+		if(!m->needs_reload) continue;
+		mod_list_dirty = true;
+
+		const char* mod_name = basename(m->lib_path);
+		printf("Loading module %s\n", mod_name);
+
+		if(m->lib_handle){
+			util_module_save(m);
+			IRC_MOD_CALL(m, on_quit, ());
+			dlclose(m->lib_handle);
+		}
+
+		dlerror();
+		m->lib_handle = dlopen(m->lib_path, RTLD_LAZY | RTLD_LOCAL);
+
+		const char* errmsg = "NULL lib handle";
+		if(m->lib_handle && !(errmsg = dlerror())){
+			m->ctx = dlsym(m->lib_handle, "irc_mod_ctx");
+			errmsg = dlerror();
+		}
+
+		if(errmsg){
+			fprintf(stderr, "** Error loading module %s: %s\n", mod_name, errmsg);
+			if(m->lib_handle){
+				dlclose(m->lib_handle);
+				m->lib_handle = NULL;
+			}
+			m->ctx = NULL;
+			continue;
+		}
+	}
+
+	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
+		if(!m->needs_reload) continue;
+		m->needs_reload = false;
+
+		const char* mod_name = basename(m->lib_path);
+		printf("Init %s...\n", mod_name);
+
+		if(!IRC_MOD_CALL(m, on_init, (core_ctx))){
+			printf("** Init failed for %s.\n", mod_name);
+			sb_erase(irc_modules, m - irc_modules);
+			--m;
 			continue;
 		}
 
-		if(ev->wd == inotify_info.module_watch){
+		for(int i = 0; i < sb_count(channels) - 1; ++i){
+			const char** c = (const char**)channels + i;
 
-			mod_list_dirty = true;
-
-			bool module_currently_loaded = false;
-			for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
-				//XXX: requires basename not modify its arg, only GNU impl guarantees this
-				const char* mod_name = basename(m->lib_path);
-				if(strcmp(mod_name, ev->name) == 0){
-					printf("Found loaded module to be reloaded: %s\n", ev->name);
-					m->needs_reload = true;
-					module_currently_loaded = true;
-					break;
-				}
+			irc_on_join(irc_ctx, "join", bot_nick, c, 1);
+			for(int j = 0; j < sb_count(chan_nicks[i]); ++j){
+				irc_on_join(irc_ctx, "join", chan_nicks[i][j], c, 1);
 			}
+		}
+	}
 
-			if(!module_currently_loaded){
+	qsort(irc_modules, sb_count(irc_modules), sizeof(*irc_modules), &util_mod_sort);
+}
 
-				printf("Found new module to load: %s\n", ev->name);
+static void util_inotify_add(INotifyWatch* watch, const char* path, uint32_t flags){
 
-				char full_path[PATH_MAX];
-				size_t base_len = strlen(inotify_info.module_path);
+	if(access(path, W_OK) != 0){
+		printf("Creating dir [%s] for inotify.\n", path);
+		if(mkdir(path, 00750) == -1){
+			perror("Error creating dir");
+		}
+	}
 
-				assert(base_len + ev->len + 1 < PATH_MAX);
+	watch->path = strdup(path);
+	watch->wd   = inotify_add_watch(inotify.fd, path, flags);
+}
 
-				memcpy(full_path, inotify_info.module_path, base_len);
-				memcpy(full_path + base_len, ev->name, ev->len);
-				full_path[base_len + ev->len] = 0;
+static void util_inotify_check(const IRCCoreCtx* core_ctx){
+	struct inotify_event* ev;
+	char buff[sizeof(*ev) + NAME_MAX + 1];
 
-				Module new_mod = {
-					.lib_path = strdup(full_path),
-					.needs_reload = true,
-				};
+	ssize_t num_read = read(inotify.fd, &buff, sizeof(buff));
 
-				sb_push(irc_modules, new_mod);
+	for(char* p = buff; (p - buff) < num_read; p += (sizeof(*ev) + ev->len)){
+		ev = (struct inotify_event*)p;
+
+		if(ev->wd == inotify.module.wd){
+			Module* m = util_module_get(ev->name, MOD_GET_SONAME);
+			if(m){
+				m->needs_reload = true;
+			} else {
+				util_module_add(ev->name);
 			}
-		} else if(ev->wd == inotify_info.data_watch){
-			size_t len = strlen(ev->name);
-			if(len <= 5 || memcmp(ev->name + (len - 5), ".data", 6) != 0){
-				continue;
-			}
+		} else if(ev->wd == inotify.data.wd){
+			if(!memmem(ev->name, ev->len, ".data", 6)) continue;
+			fprintf(stderr, "%s was modified.\n", ev->name);
 
-			for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
-				if(strlen(m->ctx->name) == len - 5 && strncmp(m->ctx->name, ev->name, len - 5) == 0){
-					fprintf(stderr, "%s was modified.\n", ev->name);
-					m->data_modified = true;
-					break;
-				}
+			Module* m = util_module_get(strndupa(ev->name, strlen(ev->name) - 5), MOD_GET_CTXNAME);
+			if(m){
+				m->data_modified = true;
+			}
+		} else if(ev->wd == inotify.ipc.wd){
+			struct sockaddr_un addr;
+
+			assert(strlen(ev->name) + strlen(inotify.ipc.path) + 1 < sizeof(addr.sun_path));
+
+			strcpy(addr.sun_path, inotify.ipc.path);
+			strcat(addr.sun_path, ev->name);
+
+			if(ev->mask & IN_DELETE){
+				util_ipc_del(addr.sun_path);
+			} else {
+				util_ipc_add(addr.sun_path);
 			}
 		}
 	}
 
 	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
-		if(m->needs_reload){
-			m->needs_reload = false;
-			m->data_modified = false;
-			
-			const char* mod_name = basename(m->lib_path);
-			fprintf(stderr, "Reloading module %s...\n", mod_name);
+		if(!m->data_modified) continue;
+		m->data_modified = false;
 
-			bool success = true;
+		fprintf(stderr, "Calling on_data_modified for %s\n", m->ctx->name);
+		IRC_MOD_CALL(m, on_modified, ());
+	}
 
-			util_module_save(m);
+	util_reload_modules(core_ctx);
+}
 
-			if(m->lib_handle){
-				IRC_MOD_CALL(m, on_quit, ());
-				dlclose(m->lib_handle);
-			}
-			
-			m->lib_handle = dlopen(m->lib_path, RTLD_LAZY | RTLD_LOCAL);
-			if(!m->lib_handle){
-				fprintf(stderr, "Error reloading module: %s\n", dlerror());
-				success = false;
-			} else {
-				m->ctx = dlsym(m->lib_handle, "irc_mod_ctx");
-				if(!m->ctx || dlerror()){
-					fprintf(stderr, "Can't reload %s, no irc_mod_ctx\n", basename(m->lib_path));
-					dlclose(m->lib_handle);
-					success = false;
-				}
-			}
+static void util_ipc_init(void){
 
-			if(success && m->ctx->on_init){
-				sb_push(mod_call_stack, m);
-				if(!m->ctx->on_init(core_ctx)){
-					fprintf(stderr, "Init function returned false on reload for %s.\n", basename(m->lib_path));
-					success = false;
-					dlclose(m->lib_handle);
-				}
-				sb_pop(mod_call_stack);
-			}
+	char ipc_dir[128];
+	struct stat st;
 
-			if(success){
-				for(int i = 0; i < sb_count(channels) - 1; ++i){
-					const char** c = (const char**)channels + i;
+	// get dir to store ipc sockets
 
-					irc_on_join(irc_ctx, "join", bot_nick, c, 1);
-					for(int j = 0; j < sb_count(chan_nicks[i]); ++j){
-						irc_on_join(irc_ctx, "join", chan_nicks[i][j], c, 1);
-					}
-				}
+	const char* ipc_dir_prefix   = getenv("XDG_RUNTIME_DIR");
+	const char  ipc_dir_suffix[] = "/insobot/";
 
-				fprintf(stderr, "Reload successful.\n");
-			} else {
-				free(m->lib_path);
-				sb_erase(irc_modules, m - irc_modules);
-				--m;
-			}
-		} else if(m->data_modified){
-			m->data_modified = false;
-			fprintf(stderr, "Calling on_data_modified for %s\n", m->ctx->name);
-			IRC_MOD_CALL(m, on_modified, ());
+	if(!ipc_dir_prefix || stat(ipc_dir_prefix, &st) == -1 || !S_ISDIR(st.st_mode)){
+		ipc_dir_prefix = "/tmp";
+	}
+
+	if(strlen(ipc_dir_prefix) + sizeof(ipc_dir_suffix) + 8 > sizeof(ipc_self.addr.sun_path)){
+		fprintf(stderr, "IPC dir name too long!");
+		return;
+	}
+
+	strcpy(ipc_dir, ipc_dir_prefix);
+	strcat(ipc_dir, ipc_dir_suffix);
+
+	if(stat(ipc_dir, &st) == -1){
+		if(mkdir(ipc_dir, 0777) == -1){
+			perror("ipc_init: mkdir");
+		}
+	}
+
+	// create our socket
+
+	ipc_self.id = getpid();
+	ipc_self.addr.sun_family = AF_UNIX;
+
+	snprintf(ipc_self.addr.sun_path, sizeof(ipc_self.addr.sun_path), "%s%d", ipc_dir, ipc_self.id);
+	unlink(ipc_self.addr.sun_path);
+
+	printf("IPC socket: %s\n", ipc_self.addr.sun_path);
+
+	ipc_socket = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if(ipc_socket == -1){
+		perror("ipc_init: socket");
+	}
+
+	if(bind(ipc_socket, &ipc_self.addr, sizeof(ipc_self.addr)) == -1){
+		perror("ipc_init: bind");
+	}
+
+	// get all the peer addresses in the dir
+
+	util_inotify_add(&inotify.ipc, ipc_dir, IN_CREATE | IN_DELETE | IN_MOVED_TO);
+
+	strcat(ipc_dir, "*");
+
+	glob_t glob_data;
+	if(glob(ipc_dir, 0, NULL, &glob_data) != 0){
+		perror("ipc_init: glob");
+	} else {
+		for(size_t i = 0; i < glob_data.gl_pathc; ++i){
+			if(strcmp(ipc_self.addr.sun_path, glob_data.gl_pathv[i]) == 0) continue;
+
+			IPCAddress peer = {
+				.id   = atoi(basename(glob_data.gl_pathv[i])),
+				.addr = { .sun_family = AF_UNIX }
+			};
+
+			printf("ipc_init: adding peer %d [%s]\n", peer.id, glob_data.gl_pathv[i]);
+
+			strcpy(peer.addr.sun_path, glob_data.gl_pathv[i]);
+			sb_push(ipc_peers, peer);
+		}
+
+		globfree(&glob_data);
+	}
+}
+
+static IPCAddress* util_ipc_add(const char* name){
+	for(int i = 0; i < sb_count(ipc_peers); ++i){
+		if(strcmp(ipc_peers[i].addr.sun_path, name) == 0){
+			return ipc_peers + i;
+		}
+	}
+
+	IPCAddress peer = {
+		.id   = atoi(basename(name)),
+		.addr = {
+			.sun_family = AF_UNIX
+		}
+	};
+
+	strcpy(peer.addr.sun_path, name);
+	sb_push(ipc_peers, peer);
+
+	printf("ipc_add: %d: [%s]\n", peer.id, peer.addr.sun_path);
+
+	return &sb_last(ipc_peers);
+}
+
+static void util_ipc_del(const char* name){
+	for(int i = 0; i < sb_count(ipc_peers); ++i){
+		if(strcmp(ipc_peers[i].addr.sun_path, name) == 0){
+			sb_erase(ipc_peers, i);
+			break;
 		}
 	}
 }
 
-static int util_mod_sort(const void* a, const void* b){
-	return ((Module*)b)->ctx->priority - ((Module*)a)->ctx->priority;
+static void util_ipc_recv(void){
+	char buffer[4096];
+	struct sockaddr_un addr;
+	socklen_t addr_len = sizeof(addr);
+
+	ssize_t num = recvfrom(ipc_socket, buffer, sizeof(buffer), 0, &addr, &addr_len);
+	if(num == -1){
+		perror("ipc_recv: recvfrom");
+		return;
+	}
+
+	assert(addr.sun_family == AF_UNIX);
+
+	IPCAddress* peer = util_ipc_add(addr.sun_path);
+
+	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
+		if(strncmp(buffer, m->ctx->name, num) == 0){
+			const size_t off = strlen(m->ctx->name) + 1;
+			IRC_MOD_CALL(m, on_ipc, (peer->id, (uint8_t*)(buffer + off), num - off));
+		}
+	}
 }
 
 static void util_find_chan_nick(const char* chan, const char* nick, int* chan_idx, int* nick_idx){
@@ -485,6 +668,23 @@ IRC_STR_CALLBACK(on_chat_msg) {
 			IRC_MOD_CALL(m, on_msg, (_chan, _name, _msg));
 		}
 	}
+}
+
+IRC_STR_CALLBACK(on_action) {
+	if(count < 2 || !params[0] || !params[1]) return;
+	const char *_chan = params[0], *_name = origin;
+
+	char* _msg = strdupa(params[1]);
+	size_t len = strlen(_msg);
+
+	// trim spaces at end of messages
+	if(len > 0){
+		for(char* p = _msg + len - 1; *p == ' '; --p){
+			*p = 0;
+		}
+	}
+
+	IRC_MOD_CALL_ALL_CHECK(on_action, (_chan, _name, _msg), IRC_CB_ACTION);
 }
 
 IRC_STR_CALLBACK(on_join) {
@@ -564,10 +764,11 @@ IRC_STR_CALLBACK(on_unknown) {
 		timerclear(&idle_time);
 		ping_sent = 0;
 	} else {
-		printf("Unknown event: %s.\n", event);
+		printf("Unknown event:\n:: %s :: %s", event, origin);
 		for(int i = 0; i < count; ++i){
-			printf(". . %s\n", params[i]);
+			printf(" :: %s", params[i]);
 		}
+		puts("");
 	}
 }
 
@@ -588,7 +789,7 @@ IRC_NUM_CALLBACK(on_numeric) {
 		
 		free(names);
 	} else {
-		printf(":: [%u]", event);
+		printf(":: [%03u] :: %s", event, origin);
 		for(int i = 0; i < count; ++i){
 			printf(" :: %s", params[i]);
 		}
@@ -623,20 +824,9 @@ static const char* core_get_datafile(void){
 	snprintf(end_ptr, sz - 1, "/data/%s.data", caller->ctx->name);
 
 	if(access(datafile_buff, F_OK) != 0){
-		// change the inotify data watch to something we don't care about to disable it temporarily
-		inotify_info.data_watch = inotify_add_watch(
-			inotify_info.fd,
-			inotify_info.data_path,
-			IN_DELETE_SELF
-		);
-
+		inotify.data.wd = inotify_add_watch(inotify.fd, inotify.data.path, IN_DELETE_SELF);
 		close(creat(datafile_buff, 00600));
-
-		inotify_info.data_watch = inotify_add_watch(
-			inotify_info.fd,
-			inotify_info.data_path,
-			IN_CLOSE_WRITE | IN_MOVED_TO
-		);
+		inotify.data.wd = inotify_add_watch(inotify.fd, inotify.data.path, IN_CLOSE_WRITE | IN_MOVED_TO);
 	}
 
 	return datafile_buff;
@@ -715,6 +905,45 @@ static void core_send_raw(const char* raw){
 	util_cmd_enqueue(IRC_CMD_RAW, NULL, raw);
 }
 
+static void core_send_ipc(int target, const void* data, size_t data_len){
+	if(ipc_socket <= 0) return;
+
+	Module* m = sb_count(mod_call_stack) ? sb_last(mod_call_stack) : NULL;
+	const char* name = m ? m->ctx->name : "core";
+	const size_t name_len = strlen(name);
+	const size_t total_len = data_len + name_len + 1;
+
+	// why doesn't AF_UNIX support MSG_MORE? :(
+	char* buffer = malloc(total_len);
+	memcpy(buffer, name, name_len + 1);
+	memcpy(buffer + name_len + 1, data, data_len);
+
+	for(IPCAddress* p = ipc_peers; p < sb_end(ipc_peers); ++p){
+		if(target != 0 && p->id != target) continue;
+
+		if(sendto(ipc_socket, buffer, total_len, 0, &p->addr, sizeof(p->addr)) == -1){
+			bool remove = false;
+
+			if(errno == ECONNREFUSED){
+				unlink(p->addr.sun_path);
+				remove = true;
+			} else if(errno == ENOENT){
+				remove = true;
+			} else {
+				perror("send_ipc: sendto");
+			}
+
+			if(remove){
+				printf("removing [%s]\n", p->addr.sun_path);
+				sb_erase(ipc_peers, p - ipc_peers);
+				--p;
+			}
+		}
+	}
+
+	free(buffer);
+}
+
 static void core_send_mod_msg(IRCModMsg* msg){
 	const char* sender = sb_last(mod_call_stack)->ctx->name;
 	IRC_MOD_CALL_ALL(on_mod_msg, (sender, msg));
@@ -750,13 +979,20 @@ int main(int argc, char** argv){
 
 	srand(time(0));
 	signal(SIGINT, &util_handle_sig);
+	assert(setlocale(LC_CTYPE, "C.UTF-8"));
+
+	// timestamp thread setup
 
 	pthread_t log_thread;
 	
 	if(!getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
 		int fds[3] = { dup(STDOUT_FILENO) };
 
-		pipe(fds + 1);
+		if(pipe(fds + 1) == -1){
+			perror("pipe");
+			abort();
+		}
+
 		dup2(fds[2], STDOUT_FILENO);
 		dup2(fds[2], STDERR_FILENO);
 
@@ -766,19 +1002,14 @@ int main(int argc, char** argv){
 		pthread_create(&log_thread, NULL, &util_log_thread_main, fds);
 	}
 
-	user = util_env_else("IRC_USER", DEFAULT_BOT_NAME);
-	pass = util_env_else("IRC_PASS", NULL);
-	serv = util_env_else("IRC_SERV", "irc.nonexistent.domain");
-	port = util_env_else("IRC_PORT", "6667");
-	bot_nick = strdup(user);
+	// path setup
 
 	char our_path[PATH_MAX] = {};
 
-	ssize_t sz = readlink("/proc/self/exe", our_path, sizeof(our_path));
-	if(sz < 0){
+	if(readlink("/proc/self/exe", our_path, sizeof(our_path) - 1) == -1){
 		err(errno, "Can't read path");
 	}
-	
+
 	char* path_end = strrchr(our_path, '/');
 	if(!path_end){
 		path_end = our_path + 1;
@@ -792,39 +1023,24 @@ int main(int argc, char** argv){
 	if(path_end + sizeof(in_dat_suffix) >= our_path + sizeof(our_path)){
 		errx(1, "Path too long!");
 	}
-	inotify_info.fd = inotify_init1(IN_NONBLOCK);
-	
+
+	// inotify init
+
+	inotify.fd = inotify_init1(IN_NONBLOCK);
+
 	memcpy(path_end, in_mod_suffix, sizeof(in_mod_suffix));
-
-	if(access(our_path, W_OK) != 0){
-		puts("No modules dir, creating it");
-		if(mkdir(our_path, 00750) == -1){
-			perror("Error creating modules dir");
-		}
-	}
-
-	inotify_info.module_path  = strdup(our_path);
-	inotify_info.module_watch = inotify_add_watch(
-		inotify_info.fd,
-		our_path,
-		IN_CLOSE_WRITE | IN_MOVED_TO
-	);
+	util_inotify_add(&inotify.module, our_path, IN_CLOSE_WRITE | IN_MOVED_TO);
 
 	memcpy(path_end, in_dat_suffix, sizeof(in_dat_suffix));
+	util_inotify_add(&inotify.data, our_path, IN_CLOSE_WRITE | IN_MOVED_TO);
 
-	if(access(our_path, W_OK) != 0){
-		puts("No modules/data dir, creating it");
-		if(mkdir(our_path, 00750) == -1){
-			perror("Error creating modules/data dir");
-		}
-	}
+	// ipc & curl init
 
-	inotify_info.data_path  = strdup(our_path);
-	inotify_info.data_watch = inotify_add_watch(
-		inotify_info.fd,
-		our_path,
-		IN_CLOSE_WRITE | IN_MOVED_TO
-	);
+	util_ipc_init();
+
+	curl_global_init(CURL_GLOBAL_ALL);
+
+	// find modules
 
 	memcpy(path_end, glob_suffix, sizeof(glob_suffix));
 
@@ -839,7 +1055,15 @@ int main(int argc, char** argv){
 		}
 	}
 
-	curl_global_init(CURL_GLOBAL_ALL);
+	printf("Found %zu modules\n", glob_data.gl_pathc);
+
+	for(int i = 0; i < glob_data.gl_pathc; ++i){
+		util_module_add(glob_data.gl_pathv[i]);
+	}
+
+	globfree(&glob_data);
+
+	// modules init
 
 	const IRCCoreCtx core_ctx = {
 		.get_username = &core_get_username,
@@ -848,6 +1072,7 @@ int main(int argc, char** argv){
 		.get_channels = &core_get_channels,
 		.send_msg     = &core_send_msg,
 		.send_raw     = &core_send_raw,
+		.send_ipc     = &core_send_ipc,
 		.send_mod_msg = &core_send_mod_msg,
 		.join         = &core_join,
 		.part         = &core_part,
@@ -855,69 +1080,34 @@ int main(int argc, char** argv){
 		.log          = &core_log,
 	};
 
-	printf("Found %zu modules\n", glob_data.gl_pathc);
-
-	for(int i = 0; i < glob_data.gl_pathc; ++i){
-		Module m = {};
-
-		void* handle = dlopen(glob_data.gl_pathv[i], RTLD_LAZY | RTLD_LOCAL);
-		char* mname  = basename(glob_data.gl_pathv[i]); //XXX: relies on GNU version of basename?
-		
-		if(!handle){
-			printf("Error: %s: dlopen error: %s\n", mname, dlerror());
-			continue;
-		}
-		
-		m.ctx = dlsym(handle, "irc_mod_ctx");
-		if(!m.ctx){
-			printf("Error: %s: No irc_mod_ctx symbol!\n", mname);
-			dlclose(handle);
-			continue;
-		}
-
-		m.lib_path = strdup(glob_data.gl_pathv[i]);
-		m.lib_handle = handle;
-
-		sb_push(irc_modules, m);
-
-		printf("Loaded module %s\n", mname);
-	}
-
-	globfree(&glob_data);
-
 	sb_push(channels, 0);
 
-	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
-		bool success = true;
-
-		sb_push(mod_call_stack, m);
-		if(m->ctx->on_init){
-			success = m->ctx->on_init(&core_ctx);
-		}
-		sb_pop(mod_call_stack);
-
-		if(!success){
-			sb_erase(irc_modules, m - irc_modules);
-			--m;
-		}
-	}
+	util_reload_modules(&core_ctx);
 	
 	if(sb_count(irc_modules) == 0){
 		errx(1, "No modules could be loaded.");
 	}
 
-	qsort(irc_modules, sb_count(irc_modules), sizeof(*irc_modules), &util_mod_sort);
-	
+	// irc init
+
+	user = util_env_else("IRC_USER", DEFAULT_BOT_NAME);
+	pass = util_env_else("IRC_PASS", NULL);
+	serv = util_env_else("IRC_SERV", "irc.nonexistent.domain");
+	port = util_env_else("IRC_PORT", "6667");
+	bot_nick = strdup(user);
+
 	irc_callbacks_t callbacks = {
-		.event_connect = irc_on_connect,
-		.event_channel = irc_on_chat_msg,
-		.event_join    = irc_on_join,
-		.event_part    = irc_on_part,
-		.event_nick    = irc_on_nick,
-		.event_numeric = irc_on_numeric,
-		.event_unknown = irc_on_unknown,
+		.event_connect     = irc_on_connect,
+		.event_channel     = irc_on_chat_msg,
+		.event_join        = irc_on_join,
+		.event_part        = irc_on_part,
+		.event_nick        = irc_on_nick,
+		.event_ctcp_action = irc_on_action,
+		.event_numeric     = irc_on_numeric,
+		.event_unknown     = irc_on_unknown,
 	};
 
+	// outer main loop, (re)set irc state
 
 	do {
 		irc_ctx = irc_create_session(&callbacks);
@@ -931,7 +1121,7 @@ int main(int argc, char** argv){
 		char* libirc_serv;
 		if(getenv("IRC_ENABLE_SSL")){
 			puts("Using ssl connection...");
-			asprintf(&libirc_serv, "#%s", serv);
+			asprintf_check(&libirc_serv, "#%s", serv);
 
 			//XXX: you might not want this!
 			irc_option_set(irc_ctx, LIBIRC_OPTION_SSL_NO_VERIFY);
@@ -945,11 +1135,13 @@ int main(int argc, char** argv){
 
 		free(libirc_serv);
 
+		// inner main loop
+
 		while(running && irc_is_connected(irc_ctx)){
 
 			util_process_pending_cmds();
 
-			util_check_inotify(&core_ctx);
+			util_inotify_check(&core_ctx);
 
 			//TODO: check on_meta & better timing for on_tick?
 			IRC_MOD_CALL_ALL(on_tick, ());
@@ -960,6 +1152,7 @@ int main(int argc, char** argv){
 			FD_ZERO(&in);
 			FD_ZERO(&out);
 			FD_SET(STDIN_FILENO, &in);
+			FD_SET(ipc_socket, &in);
 
 			if(irc_add_select_descriptors(irc_ctx, &in, &out, &max_fd) != 0){
 				fprintf(stderr, "Error adding select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
@@ -968,39 +1161,11 @@ int main(int argc, char** argv){
 			struct timeval tv = {
 				.tv_sec  = 0,
 				.tv_usec = 250000,
-			}, tv_orig = tv;
+			};
 	
 			int ret = select(max_fd + 1, &in, &out, NULL, &tv);
 				
-			if(ret < 0){
-				perror("select");
-			} else if(ret == 0){
-				timersub(&tv_orig, &tv, &tv);
-				timeradd(&tv, &idle_time, &idle_time);
-
-				//TODO: figure out why this doesn't work properly over ssl
-#if 0	
-				if(idle_time.tv_sec >= 30 && !ping_sent){
-					irc_send_raw(irc_ctx, "PING %s", serv);
-					ping_sent = 1;
-				}
-			
-				if(idle_time.tv_sec >= 60){
-					puts("Timeout > 60... quitting");
-					irc_disconnect(irc_ctx);
-					ping_sent = 0;
-				}
-#endif		
-			} else if(ret > 0){
-#if 0
-				int i;
-				for(i = 0; i <= max_fd; ++i){
-					if(FD_ISSET(i, &in)){
-						timerclear(&idle_time);
-						break;
-					}
-				}
-#endif
+			if(ret > 0){
 				if(irc_process_select_descriptors(irc_ctx, &in, &out) != 0){
 					fprintf(stderr, "Error processing select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
 				}
@@ -1013,6 +1178,12 @@ int main(int argc, char** argv){
 						IRC_MOD_CALL_ALL(on_stdin, (stdin_buf));
 					}
 				}
+
+				if(FD_ISSET(ipc_socket, &in)){
+					util_ipc_recv();
+				}
+			} else if(ret){
+				perror("select");
 			}
 		}
 	
@@ -1025,7 +1196,7 @@ int main(int argc, char** argv){
 			} else {
 				puts("Restarting");
 			}
-			usleep(5000000);
+			usleep(10000000L);
 		}
 	} while(running);
 
@@ -1058,8 +1229,15 @@ int main(int argc, char** argv){
 
 	free(bot_nick);
 
-	free(inotify_info.module_path);
-	free(inotify_info.data_path);
+	free(inotify.module.path);
+	free(inotify.data.path);
+	free(inotify.ipc.path);
+
+	if(ipc_socket > 0){
+		close(ipc_socket);
+		unlink(ipc_self.addr.sun_path);
+	}
+	sb_free(ipc_peers);
 
 	if(!getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
 		pthread_cancel(log_thread);

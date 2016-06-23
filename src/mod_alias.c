@@ -203,7 +203,7 @@ static void alias_add(const char* chan, const char* key, const char* msg, int pe
 
 		char* full_key;
 		if(chan){
-			asprintf(&full_key, "%s,%s", chan, key);
+			asprintf_check(&full_key, "%s,%s", chan, key);
 		} else {
 			full_key = strdup(key);
 		}
@@ -270,7 +270,7 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 				int otheridx;
 				if(alias_find(chan, otherkey, &otheridx, NULL)){
 					char* chan_key;
-					asprintf(&chan_key, "%s,%s", chan, key);
+					asprintf_check(&chan_key, "%s,%s", chan, key);
 					sb_push(alias_keys[otheridx], chan_key);
 					ctx->send_msg(chan, "%s: Alias %s set.", name, key);
 				} else {
@@ -496,6 +496,10 @@ static void alias_msg(const char* chan, const char* name, const char* msg){
 		}
 	}
 	sb_push(msg_buf, 0);
+
+	if(*msg_buf == '.' || *msg_buf == '!' || *msg_buf == '\\'){
+		*msg_buf = ' ';
+	}
 
 	if(value->me_action){
 		ctx->send_msg(chan, "\001ACTION %s\001", msg_buf);

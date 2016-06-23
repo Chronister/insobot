@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <assert.h>
 #include <time.h>
 #include <curl/curl.h>
 #include "stb_sb.h"
@@ -27,6 +28,13 @@
 	sizeof(x) / sizeof(*x);                                      \
 })
 
+#define asprintf_check(...) ({       \
+	if(asprintf(__VA_ARGS__) == -1){ \
+		perror("asprintf");          \
+		assert(0);                   \
+	}                                \
+})
+
 static inline size_t inso_curl_callback(char* ptr, size_t sz, size_t nmemb, void* data){
 	char** out = (char**)data;
 	const size_t total = sz * nmemb;
@@ -36,8 +44,8 @@ static inline size_t inso_curl_callback(char* ptr, size_t sz, size_t nmemb, void
 	return total;
 }
 
-static inline CURL* inso_curl_init(const char* url, char** data){
-	CURL* curl = curl_easy_init();
+static void inso_curl_reset(CURL* curl, const char* url, char** data){
+	curl_easy_reset(curl);
 
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
@@ -47,7 +55,11 @@ static inline CURL* inso_curl_init(const char* url, char** data){
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &inso_curl_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, data);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8);
+}
 
+static inline CURL* inso_curl_init(const char* url, char** data){
+	CURL* curl = curl_easy_init();
+	inso_curl_reset(curl, url, data);
 	return curl;
 }
 

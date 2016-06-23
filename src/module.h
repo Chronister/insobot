@@ -18,11 +18,12 @@ typedef struct IRCModuleCtx_ {
 	unsigned int       flags;
 	
 	bool (*on_init)    (const IRCCoreCtx* ctx);
-	void (*on_quit)    (void); //TODO
+	void (*on_quit)    (void);
 
 	// IRC event callbacks
 	void (*on_connect) (const char* serv);
 	void (*on_msg)     (const char* chan, const char* name, const char* msg);
+	void (*on_action)  (const char* chan, const char* name, const char* msg);
 	void (*on_join)    (const char* chan, const char* name);
 	void (*on_part)    (const char* chan, const char* name);
 	void (*on_nick)    (const char* prev_nick, const char* new_nick);
@@ -47,6 +48,12 @@ typedef struct IRCModuleCtx_ {
 
 	// called if something was written to stdin
 	void (*on_stdin)   (const char* text);
+
+	// called when a message is sent
+	void (*on_msg_out) (const char* chan, const char* msg);
+
+	// called on receipt of an inter-process message
+	void (*on_ipc)     (int sender_id, const uint8_t* data, size_t data_len);
 } IRCModuleCtx;
 
 // passed to modules to provide functions for them to use.
@@ -60,6 +67,7 @@ struct IRCCoreCtx_ {
 	void           (*part)         (const char* chan);
 	void           (*send_msg)     (const char* chan, const char* fmt, ...) __attribute__ ((format (printf, 2, 3)));
 	void           (*send_raw)     (const char* raw);
+	void           (*send_ipc)     (int target, const void* data, size_t data_len); // target 0 == broadcast
 	void           (*send_mod_msg) (IRCModMsg* msg);
 	void           (*save_me)      (void);
 	void           (*log)          (const char* fmt, ...) __attribute__ ((format (printf, 1, 2)));
@@ -71,9 +79,10 @@ enum  {
 	IRC_CB_CMD,
 	IRC_CB_JOIN,
 	IRC_CB_PART,
+	IRC_CB_ACTION,
 };
 
-// used for flags field of IRCModuleCtx
+// used for the flags field of IRCModuleCtx
 enum {
 	IRC_MOD_GLOBAL  = 1, // not a module that can be enabled / disabled per channel
 	IRC_MOD_DEFAULT = 2, // enabled by default when joining new channels

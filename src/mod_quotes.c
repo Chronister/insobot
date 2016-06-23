@@ -53,20 +53,21 @@ static int quotes_sem;
 static struct sembuf quotes_lock   = { .sem_op = -1, .sem_flg = SEM_UNDO };
 static struct sembuf quotes_unlock = { .sem_op = 1 , .sem_flg = SEM_UNDO };
 
-static char** channels;
-
 typedef struct Quote_ {
 	uint32_t id;
 	time_t timestamp;
 	char* text;
 } Quote;
 
+static char** channels;
 static Quote** chan_quotes;
 
 static bool quotes_dirty;
 
 // XXX: this is a bit of a hack
 static Quote* delete_chan_ptr;
+
+static CURL* curl;
 
 static char* gen_escaped_csv(Quote* quotes){
 	char* csv = NULL;
@@ -180,9 +181,12 @@ static void quotes_free(void){
 static void quotes_quit(void){
 	quotes_free();
 
+	curl_easy_cleanup(curl);
+
 	free(gist_auth);
 	free(gist_api_url);
 	free(gist_pub_url);
+	free(gist_etag);
 }
 
 static size_t curl_header_cb(char* buffer, size_t size, size_t nelem, void* arg){
@@ -199,14 +203,14 @@ static bool quotes_reload(void){
 
 	char* data = NULL;
 	
-	CURL* curl = inso_curl_init(gist_api_url, &data);
+	inso_curl_reset(curl, gist_api_url, &data);
 	curl_easy_setopt(curl, CURLOPT_USERPWD, gist_auth);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &curl_header_cb);
 
 	struct curl_slist* slist = NULL;
 	if(gist_etag){
 		char* h;
-		asprintf(&h, "If-None-Match: %s", gist_etag);
+		asprintf_check(&h, "If-None-Match: %s", gist_etag);
 		slist = curl_slist_append(NULL, h);
 
 		free(h);
@@ -222,8 +226,6 @@ static bool quotes_reload(void){
 
 	long http_code = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-	curl_easy_cleanup(curl);
 
 	if(ret != 0){
 		printf("CURL returned %d, %s\n", ret, curl_easy_strerror(ret));
@@ -324,9 +326,9 @@ static bool quotes_init(const IRCCoreCtx* _ctx){
 		return false;
 	}
 
-	asprintf(&gist_auth, "%s:%s", gist_user, gist_token);
-	asprintf(&gist_api_url, "https://api.github.com/gists/%s", gist_id);
-	asprintf(&gist_pub_url, "https://gist.github.com/%s", gist_id);
+	asprintf_check(&gist_auth, "%s:%s", gist_user, gist_token);
+	asprintf_check(&gist_api_url, "https://api.github.com/gists/%s", gist_id);
+	asprintf_check(&gist_pub_url, "https://gist.github.com/%s", gist_id);
 
 	char keybuf[9] = {};
 	memcpy(keybuf, gist_id, 8);
@@ -349,6 +351,8 @@ static bool quotes_init(const IRCCoreCtx* _ctx){
 			perror("semctl");
 		}
 	}
+
+	curl = curl_easy_init();
 
 	return quotes_reload();
 }
@@ -421,7 +425,7 @@ static const char* get_chan(const char* chan, const char** arg, Quote*** qlist){
 
 static void quotes_cmd(const char* chan, const char* name, const char* arg, int cmd){
 
-	bool has_cmd_perms = strcasecmp(chan+1, name) == 0 || inso_is_admin(ctx, name);
+	bool has_cmd_perms = strcasecmp(chan+1, name) == 0 || inso_is_wlist(ctx, name);
 
 	semop(quotes_sem, &quotes_lock, 1);
 
@@ -710,17 +714,12 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 				break;
 			}
 
-			int id = rand() % sb_count(*quotes);
+			Quote* q = *quotes + (rand() % sb_count(*quotes));
 
-			Quote* q = get_quote(quote_chan, id);
-			if(q){
-				struct tm* date_tm = gmtime(&q->timestamp);
-				char date[256];
-				strftime(date, sizeof(date), "%F", date_tm);
-				ctx->send_msg(chan, "Quote %d: \"%s\" --%s %s", id, q->text, quote_chan+1, date);
-			} else {
-				ctx->send_msg(chan, "%s: Can't find that quote.", name);
-			}
+			struct tm* date_tm = gmtime(&q->timestamp);
+			char date[256];
+			strftime(date, sizeof(date), "%F", date_tm);
+			ctx->send_msg(chan, "Quote %d: \"%s\" --%s %s", q->id, q->text, quote_chan+1, date);
 		}
 	}
 
@@ -807,8 +806,9 @@ static bool quotes_save(FILE* file){
 
 	char* data = NULL;
 
-	CURL* curl = inso_curl_init(gist_api_url, &data);
 	struct curl_slist* slist = curl_slist_append(NULL, "Content-Type: application/json");
+
+	inso_curl_reset(curl, gist_api_url, &data);
 	curl_easy_setopt(curl, CURLOPT_USERPWD, gist_auth);
 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
 	curl_easy_setopt(curl, CURLOPT_POST, 1);
@@ -834,8 +834,6 @@ static bool quotes_save(FILE* file){
 	sb_free(data);
 
 	curl_slist_free_all(slist);
-
-	curl_easy_cleanup(curl);
 
 	yajl_gen_free(json);
 

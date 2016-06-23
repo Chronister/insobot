@@ -119,7 +119,7 @@ static void bonus_cmd(const char* chan, const char* name, const char* msg, int c
             dice_params.drops = -1;
             for (char* cur = num_start; ; ++cur) {
                 if (parse_state == DICE_NUMDICE) {
-                    if (isspace(*cur)) { continue; }
+                    if (isspace(*cur)) { ++num_start; continue; }
                 }
 
                 if (*cur == 'd') {
@@ -128,8 +128,11 @@ static void bonus_cmd(const char* chan, const char* name, const char* msg, int c
                             *cur = '\0';
                             int scanned = sscanf(num_start, "%u", &dice_params.dice);
                             if (scanned != 1) {
-                                ctx->send_msg(chan, "I don't have %s dice just lying around!", num_start);
-                                return;
+                                if (num_start != cur) {
+                                    ctx->send_msg(chan, "I don't have %s dice just lying around!", num_start);
+                                    return;
+                                }
+                                dice_params.dice = 1;
                             }
                             num_start = cur + 1;
                             parse_state = DICE_NUMFACES; 
