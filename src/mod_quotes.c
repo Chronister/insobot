@@ -14,10 +14,10 @@
 
 static bool quotes_init     (const IRCCoreCtx*);
 static void quotes_modified (void);
-static void quotes_join     (const char*, const char*);
 static void quotes_cmd      (const char*, const char*, const char*, int);
 static bool quotes_save     (FILE*);
 static void quotes_quit     (void);
+static void quotes_ipc      (int, const uint8_t*, size_t);
 
 enum { GET_QUOTE, ADD_QUOTE, DEL_QUOTE, FIX_QUOTE, FIX_TIME, LIST_QUOTES, SEARCH_QUOTES, GET_RANDOM };
 
@@ -27,9 +27,9 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_init     = &quotes_init,
 	.on_modified = &quotes_modified,
 	.on_cmd      = &quotes_cmd,
-	.on_join     = &quotes_join,
 	.on_save     = &quotes_save,
 	.on_quit     = &quotes_quit,
+	.on_ipc      = &quotes_ipc,
 	.commands    = DEFINE_CMDS (
 		[GET_QUOTE]     = CONTROL_CHAR"q    "CONTROL_CHAR"quote",
 		[ADD_QUOTE]     = CONTROL_CHAR"qadd "CONTROL_CHAR"q+ " CONTROL_CHAR"addquote",
@@ -361,16 +361,7 @@ static void quotes_modified(void){
 	printf("RELOAD: %d\n", quotes_reload());
 }
 
-static Quote** get_quotes(const char* chan){
-	for(int i = 0; i < sb_count(channels); ++i){
-		if(strcmp(chan, channels[i]) == 0){
-			return chan_quotes + i;
-		}
-	}
-	return NULL;
-}
-
-static Quote* get_quote(const char* chan, int id){
+static Quote* quote_get(const char* chan, int id){
 	int index = -1;
 	for(int i = 0; i < sb_count(channels); ++i){
 		if(strcmp(chan, channels[i]) == 0){
@@ -390,56 +381,86 @@ static Quote* get_quote(const char* chan, int id){
 	return NULL;
 }
 
-static const char* get_chan(const char* chan, const char** arg, Quote*** qlist){
-	if(**arg != '#'){
-		if(qlist){
-			*qlist = get_quotes(chan);
+static const char* quotes_get_chan(const char* default_chan, const char** arg, Quote*** qlist, bool* same){
+
+	const char* chan = default_chan;
+	if(same) *same = true;
+
+	// if the arg starts with a #, parse the channel out of it
+	if(**arg == '#'){
+		const char* end = strchrnul(*arg, ' ');
+
+		char* new_chan = strndupa(*arg, end - *arg);
+		for(char* c = new_chan; *c; ++c){
+			*c = tolower(*c);
 		}
-		return chan;
+
+		*arg = *end ? end + 1 : end;
+		chan = new_chan;
+
+		if(same) *same = false;
 	}
 
-	const char* end = strchrnul(*arg, ' ');
-
-	for(char** c = channels; c < sb_end(channels); ++c){
-		if(strncasecmp(*arg, *c, end - *arg) == 0 && (*c)[end - *arg] == 0){
-			*arg = *end ? end + 1 : end;
-			if(qlist){
-				*qlist = chan_quotes + (c - channels);
-			}
-			return *c;
+	bool found = false;
+	for(int i = 0; i < sb_count(channels); ++i){
+		if(strcmp(channels[i], chan) == 0){
+			chan = channels[i];
+			if(qlist) *qlist = chan_quotes + i;
+			found = true;
 		}
 	}
 
-	char* new_chan = strndup(*arg, end - *arg);
-	for(char* c = new_chan; *c; ++c) *c = tolower(*c);
+	if(!found){
+		sb_push(channels, strdup(chan));
+		sb_push(chan_quotes, 0);
+		chan = sb_last(channels);
+		if(qlist) *qlist = &sb_last(chan_quotes);
+	}
 
-	*arg = *end ? end + 1 : end;
+	return chan;
+}
 
-	sb_push(channels, new_chan);
-	sb_push(chan_quotes, 0);
+static char quote_date_buf[64];
+static const char* quote_strtime(Quote* q){
+	struct tm* date_tm = gmtime(&q->timestamp);
+	strftime(quote_date_buf, sizeof(quote_date_buf), "%F", date_tm);
+	return quote_date_buf;
+}
 
-	*qlist = chan_quotes + (sb_count(channels) - 1);
+static void quotes_notify(const char* chan, const char* name, Quote* q){
 
-	return new_chan;
+	bool known_channel = false;
+	for(const char** c = ctx->get_channels(); *c; ++c){
+		if(strcasecmp(*c, chan) == 0){
+			known_channel = true;
+			break;
+		}
+	}
+
+	if(known_channel && q){
+		ctx->send_msg(chan, "%s added quote %d: \"%s\".", name, q->id, q->text);
+	}
 }
 
 static void quotes_cmd(const char* chan, const char* name, const char* arg, int cmd){
 
-	bool has_cmd_perms = strcasecmp(chan+1, name) == 0 || inso_is_wlist(ctx, name);
+	bool is_wlist = inso_is_wlist(ctx, name);
+	bool has_cmd_perms = strcasecmp(chan+1, name) == 0 || is_wlist;
+
+	bool empty_arg = !*arg++;
 
 	semop(quotes_sem, &quotes_lock, 1);
 
+	quotes_reload();
+
+	bool same_chan;
+	Quote** quotes;
+	const char* quote_chan = quotes_get_chan(chan, &arg, &quotes, &same_chan);
+
 	switch(cmd){
 		case GET_QUOTE: {
-			if(!*arg++){
+			if(empty_arg){
 				ctx->send_msg(chan, "%s: Usage: \\q <id>", name);
-				break;
-			}
-
-			quotes_reload();
-			const char* quote_chan = get_chan(chan, &arg, NULL);
-			if(!quote_chan){
-				ctx->send_msg(chan, "%s: Unknown channel.", name);
 				break;
 			}
 
@@ -450,12 +471,9 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 				break;
 			}
 
-			Quote* q = get_quote(quote_chan, id);
+			Quote* q = quote_get(quote_chan, id);
 			if(q){
-				struct tm* date_tm = gmtime(&q->timestamp);
-				char date[256];
-				strftime(date, sizeof(date), "%F", date_tm);
-				ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", id, q->text, quote_chan+1, date);
+				ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", id, q->text, quote_chan+1, quote_strtime(q));
 			} else {
 				ctx->send_msg(chan, "%s: Can't find that quote.", name);
 			}
@@ -463,17 +481,13 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 
 		case ADD_QUOTE: {
 			if(!has_cmd_perms) break;
-			if(!*arg++){
+
+			if(empty_arg){
 				ctx->send_msg(chan, "%s: Usage: \\qadd <text>", name);
 				break;
 			}
 
-			quotes_reload();
-
-			Quote** quotes = NULL;
-			const char* quote_chan = get_chan(chan, &arg, &quotes);
-			if(!quote_chan){
-				ctx->send_msg(chan, "%s: Unknown channel.", name);
+			if(!same_chan && !is_wlist){
 				break;
 			}
 
@@ -481,30 +495,33 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			if(sb_count(*quotes) > 0){
 				id = sb_last(*quotes).id + 1;
 			}
-			Quote q = {
-				.id = id,
-				.text = strdup(arg),
-				.timestamp = time(0)
-			};
+			Quote q = { .id = id, .text = strdup(arg), .timestamp = time(0) };
 			sb_push(*quotes, q);
 			ctx->send_msg(chan, "%s: Added as quote %d.", name, id);
+
+			// if adding to another channel, send a message to that channel.
+			if(!same_chan){
+				quotes_notify(quote_chan, name, &q);
+			}
+
+			// notify other instances so they can also send messages to the affected channel
+			char ipc_buf[256];
+			int ipc_len = snprintf(ipc_buf, sizeof(ipc_buf), "ADD %d %s %s", id, name, quote_chan);
+			ctx->send_ipc(0, ipc_buf, ipc_len + 1);
+
 			quotes_dirty = true;
 			ctx->save_me();
 		} break;
 
 		case DEL_QUOTE: {
 			if(!has_cmd_perms) break;
-			if(!*arg++){
+
+			if(empty_arg){
 				ctx->send_msg(chan, "%s: Usage: \\qdel <id>", name);
 				break;
 			}
 
-			quotes_reload();
-
-			Quote** quotes = NULL;
-			const char* quote_chan = get_chan(chan, &arg, &quotes);
-			if(!quote_chan){
-				ctx->send_msg(chan, "%s: Unknown channel.", name);
+			if(!same_chan && !is_wlist){
 				break;
 			}
 
@@ -515,7 +532,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 				break;
 			}
 
-			Quote* q = get_quote(quote_chan, id);
+			Quote* q = quote_get(quote_chan, id);
 			if(q){
 				int off = q - *quotes;
 				sb_erase(*quotes, off);
@@ -532,33 +549,28 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 
 		case FIX_QUOTE: {
 			if(!has_cmd_perms) break;
-			if(!*arg++){
+
+			if(empty_arg){
 				ctx->send_msg(chan, "%s: Usage: \\qfix <id> <new_text>", name);
 				break;
 			}
 
-			quotes_reload();
-
-			Quote** quotes = NULL;
-			const char* quote_chan = get_chan(chan, &arg, &quotes);
-			if(!quote_chan){
-				ctx->send_msg(chan, "%s: Unknown channel.", name);
+			if(!same_chan && !is_wlist){
 				break;
 			}
 
 			char* arg2;
 			int id = strtol(arg, &arg2, 0);
-			
 			if(!arg2 || arg2 == arg || id < 0){
 				ctx->send_msg(chan, "%s: That id doesn't look valid.", name);
 				break;
 			}
-			if(*arg2 != ' '){
+			if(arg2[0] != ' ' || !arg2[1]){
 				ctx->send_msg(chan, "%s: Usage: \\qfix <id> <new_text>", name);
 				break;
 			}
 
-			Quote* q = get_quote(quote_chan, id);
+			Quote* q = quote_get(quote_chan, id);
 			if(q){
 				free(q->text);
 				q->text = strdup(arg2 + 1);
@@ -572,17 +584,13 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 
 		case FIX_TIME: {
 			if(!has_cmd_perms) break;
-			if(!*arg++){
+
+			if(empty_arg){
 				ctx->send_msg(chan, "%s: Usage: \\qft <id> <YYYY-MM-DD hh:mm:ss>", name);
 				break;
 			}
 
-			quotes_reload();
-
-			Quote** quotes = NULL;
-			const char* quote_chan = get_chan(chan, &arg, &quotes);
-			if(!quote_chan){
-				ctx->send_msg(chan, "%s: Unknown channel.", name);
+			if(!same_chan && !is_wlist){
 				break;
 			}
 
@@ -592,12 +600,12 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 				ctx->send_msg(chan, "%s: That id doesn't look valid.", name);
 				break;
 			}
-			if(*arg2 != ' '){
+			if(arg2[0] != ' ' || !arg2[1]){
 				ctx->send_msg(chan, "%s: Usage: \\qft <id> <YYYY-MM-DD hh:mm:ss>", name);
 				break;
 			}
 
-			Quote* q = get_quote(quote_chan, id);
+			Quote* q = quote_get(quote_chan, id);
 			if(!q){
 				ctx->send_msg(chan, "%s: Can't find that quote.", name);
 				break;
@@ -621,17 +629,8 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 		} break;
 
 		case SEARCH_QUOTES: {
-			if(!*arg++){
+			if(empty_arg){
 				ctx->send_msg(chan, "%s: Give me something to search for!", name);
-				break;
-			}
-
-			quotes_reload();
-
-			Quote** quotes;
-			const char* quote_chan = get_chan(chan, &arg, &quotes);
-			if(!quote_chan){
-				ctx->send_msg(chan, "%s: Unknown channel.", name);
 				break;
 			}
 
@@ -648,7 +647,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			}
 
 			if(sb_count(*quotes) == 0){
-				ctx->send_msg(chan, "%s: There aren't any quotes here to search.", name);
+				ctx->send_msg(chan, "%s: There aren't any quotes to search.", name);
 				break;
 			}
 
@@ -666,10 +665,11 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 					last_found_q = q;
 
 					int ret = snprintf(buf_ptr, buf_len, "%d, ", q->id);
-					if(ret <= buf_len){
+					if(ret < buf_len){
 						buf_ptr += ret;
 						buf_len -= ret;
 					} else {
+						*buf_ptr = 0;
 						more_flag = true;
 						break;
 					}
@@ -678,10 +678,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 
 			if(found_count == 1){
 				Quote* q = last_found_q;
-				struct tm* date_tm = gmtime(&q->timestamp);
-				char date[32];
-				strftime(date, sizeof(date), "%F", date_tm);
-				ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", q->id, q->text, quote_chan+1, date);
+				ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", q->id, q->text, quote_chan+1, quote_strtime(q));
 			} else if(found_count > 1){
 				if(more_flag){
 					ctx->send_msg(chan, "%s: Matching quotes: %s and more.", name, msg_buf);
@@ -697,51 +694,17 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 		} break;
 
 		case GET_RANDOM: {
-
-			if(*arg) arg++;
-
-			quotes_reload();
-
-			Quote** quotes = NULL;
-			const char* quote_chan = get_chan(chan, &arg, &quotes);
-			if(!quote_chan){
-				ctx->send_msg(chan, "%s: Unknown channel.", name);
-				break;
-			}
-
 			if(!sb_count(*quotes)){
 				ctx->send_msg(chan, "%s: No quotes found.", name);
 				break;
 			}
 
 			Quote* q = *quotes + (rand() % sb_count(*quotes));
-
-			struct tm* date_tm = gmtime(&q->timestamp);
-			char date[256];
-			strftime(date, sizeof(date), "%F", date_tm);
-			ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", q->id, q->text, quote_chan+1, date);
+			ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", q->id, q->text, quote_chan+1, quote_strtime(q));
 		}
 	}
 
 	semop(quotes_sem, &quotes_unlock, 1);
-}
-
-static void quotes_join(const char* chan, const char* user){
-	if(strcasecmp(user, ctx->get_username()) != 0) return;
-
-	bool found = false;
-	for(char** c = channels; c < sb_end(channels); ++c){
-		if(strcasecmp(chan, *c) == 0){
-			found = true;
-			break;
-		}
-	}
-
-	if(!found){
-		fprintf(stderr, "mod_quotes: adding [%s]\n", chan);
-		sb_push(channels, strdup(chan));
-		sb_push(chan_quotes, 0);
-	}
 }
 
 static const char desc_key[]    = "description";
@@ -840,3 +803,17 @@ static bool quotes_save(FILE* file){
 	return true;
 }
 
+static void quotes_ipc(int sender, const uint8_t* data, size_t data_len){
+	if(!memchr(data, 0, data_len)) return;
+
+	int id;
+	char *name = NULL, *chan = NULL;
+
+	if(sscanf(data, "ADD %d %ms %ms", &id, &name, &chan) == 3){
+		quotes_reload();
+		quotes_notify(chan, name, quote_get(chan, id));
+	}
+
+	free(name);
+	free(chan);
+}

@@ -34,8 +34,8 @@ static regex_t twitter_url_regex;
 static const char* twitter_token;
 
 static regex_t steam_url_regex;
-
 static regex_t vimeo_url_regex;
+static regex_t xkcd_url_regex;
 
 static bool linkinfo_init(const IRCCoreCtx* _ctx){
 	ctx = _ctx;
@@ -90,6 +90,12 @@ static bool linkinfo_init(const IRCCoreCtx* _ctx){
 		REG_EXTENDED | REG_ICASE
 	) == 0);
 
+	ret = ret & (regcomp(
+		&xkcd_url_regex,
+		"https?://xkcd.com/([0-9]+)",
+		REG_EXTENDED | REG_ICASE
+	) == 0);
+
 	twitter_token = getenv("INSOBOT_TWITTER_TOKEN");
 	if(!twitter_token || !*twitter_token){
 		fputs("mod_linkinfo: no twitter token, expanding tweets won't work.\n", stderr);
@@ -107,6 +113,7 @@ static void linkinfo_quit(void){
 	regfree(&twitter_url_regex);
 	regfree(&steam_url_regex);
 	regfree(&vimeo_url_regex);
+	regfree(&xkcd_url_regex);
 }
 
 static void do_youtube_info(const char* chan, const char* msg, regmatch_t* matches){
@@ -358,6 +365,7 @@ static void do_twitter_info(const char* chan, const char* msg, regmatch_t* match
 
 //	printf("TWITTER DEBUG: [%s]\n", data);
 
+	const char* date_path[] = { "created_at", NULL };
 	const char* text_path[] = { "text", NULL };
 	const char* user_path[] = { "user", "name", NULL };
 	const char* urls_path[] = { "entities", "urls", NULL };
@@ -370,14 +378,40 @@ static void do_twitter_info(const char* chan, const char* msg, regmatch_t* match
 		goto out;
 	}
 
+	yajl_val date = yajl_tree_get(root, date_path, yajl_t_string);
 	yajl_val text = yajl_tree_get(root, text_path, yajl_t_string);
 	yajl_val user = yajl_tree_get(root, user_path, yajl_t_string);
 	yajl_val urls = yajl_tree_get(root, urls_path, yajl_t_array);
 	yajl_val media = yajl_tree_get(root, media_path, yajl_t_array);
 
-	if(!text || !user){
-		fprintf(stderr, "mod_linkinfo: text or user null!\n");
+	if(!date || !text || !user){
+		fprintf(stderr, "mod_linkinfo: date/text/user null!\n");
 		goto out;
+	}
+
+	struct tm tweet_tm = {};
+	strptime(date->u.string, "%a %b %d %T %z %Y", &tweet_tm);
+	time_t time_diff = time(0) - timegm(&tweet_tm);
+	char time_buf[32] = {};
+
+	// TODO: make a general version of this duration-to-string stuff and put it in utils.h
+	// since i end up doing this differently everywhere...
+
+	struct {
+		const char* unit;
+		int limit;
+		int divisor;
+	} time_info[] = { { "s", 60, 1}, { "m", (60*60), 60 }, { "h", (60*60*24), (60*60) }, { "d", (60*60*24*365), (60*60*24) } };
+
+	for(int i = 0; i < ARRAY_SIZE(time_info); ++i){
+		if(time_diff < time_info[i].limit){
+			snprintf(time_buf, sizeof(time_buf), "%d%s ago", (int)time_diff / time_info[i].divisor, time_info[i].unit);
+			break;
+		}
+	}
+
+	if(!*time_buf){
+		strftime(time_buf, sizeof(time_buf), "%F", &tweet_tm);
 	}
 
 	Replacement* url_replacements = NULL;
@@ -413,7 +447,7 @@ static void do_twitter_info(const char* chan, const char* msg, regmatch_t* match
 
 	sb_free(url_replacements);
 
-	ctx->send_msg(chan, "↑ Tweet by %s: [%s]", user->u.string, fixed_text);
+	ctx->send_msg(chan, "↑ Tweet by %s: [%s] [%s]", user->u.string, fixed_text, time_buf);
 
 out:
 	if(root){
@@ -451,13 +485,17 @@ static void do_steam_info(const char* chan, const char* msg, regmatch_t* matches
 		goto out;
 	}
 
-	const char* title_path[] = { appid, "data", "name", NULL };
-	const char* price_path[] = { appid, "data", "price_overview", "final", NULL };
-	const char* plats_path[] = { appid, "data", "platforms", NULL };
+	const char* title_path[]  = { appid, "data", "name", NULL };
+	const char* price_path[]  = { appid, "data", "price_overview", "final", NULL };
+	const char* plats_path[]  = { appid, "data", "platforms", NULL };
+	const char* csoon_path[]  = { appid, "data", "release_date", "coming_soon", NULL };
+	const char* isfree_path[] = { appid, "data", "is_free", NULL };
 
-	yajl_val title = yajl_tree_get(root, title_path, yajl_t_string);
-	yajl_val price = yajl_tree_get(root, price_path, yajl_t_number);
-	yajl_val plats = yajl_tree_get(root, plats_path, yajl_t_object);
+	yajl_val title  = yajl_tree_get(root, title_path, yajl_t_string);
+	yajl_val price  = yajl_tree_get(root, price_path, yajl_t_number);
+	yajl_val plats  = yajl_tree_get(root, plats_path, yajl_t_object);
+	yajl_val csoon  = yajl_tree_get(root, csoon_path, yajl_t_any);
+	yajl_val isfree = yajl_tree_get(root, isfree_path, yajl_t_any);
 
 	if(!title || !plats){
 		fprintf(stderr, "mod_linkinfo: steam title/plats null!\n");
@@ -484,7 +522,8 @@ static void do_steam_info(const char* chan, const char* msg, regmatch_t* matches
 		int price_hi = price->u.number.i / 100, price_lo = price->u.number.i % 100;
 		ctx->send_msg(chan, "↑ Steam: [%s] [%s] [$%d.%02d]", title->u.string, plat_str, price_hi, price_lo);
 	} else {
-		ctx->send_msg(chan, "↑ Steam: [%s] [%s]", title->u.string, plat_str);
+		const char* status = YAJL_IS_TRUE(isfree) ? "[Free]" : YAJL_IS_TRUE(csoon) ? "[Coming Soon]" : "";
+		ctx->send_msg(chan, "↑ Steam: [%s] [%s] %s", title->u.string, plat_str, status);
 	}
 
 out:
@@ -555,6 +594,45 @@ out:
 	sb_free(data);
 }
 
+static void do_xkcd_info(const char* chan, const char* msg, regmatch_t* matches){
+
+	const char* id = strndupa(msg + matches[1].rm_so, matches[1].rm_eo - matches[1].rm_so);
+	char* data = NULL;
+	char* url;
+	asprintf_check(&url, "https://xkcd.com/%s/info.0.json", id);
+
+	CURL* curl = inso_curl_init(url, &data);
+
+	CURLcode err;
+	if((err = curl_easy_perform(curl)) == CURLE_OK){
+		sb_push(data, 0);
+
+		static const char* title_path[] = { "title", NULL };
+		static const char* img_path[] = { "img", NULL };
+		static const char* alt_path[] = { "alt", NULL };
+
+		yajl_val root = yajl_tree_parse(data, NULL, 0);
+		yajl_val title = yajl_tree_get(root, title_path, yajl_t_string);
+		yajl_val img = yajl_tree_get(root, img_path, yajl_t_string);
+		yajl_val alt = yajl_tree_get(root, alt_path, yajl_t_string);
+
+		if(!root || !title || !img || !alt){
+			fprintf(stderr, "mod_linkinfo; xkcd expand failed\n");
+		} else {
+			const char* suffix = strlen(alt->u.string) > 200 ? "..." : "";
+			ctx->send_msg(chan, "↑ xkcd %s: \"%s\", [%s] [Alt: %.200s%s]", id, title->u.string, img->u.string, alt->u.string, suffix);
+		}
+
+		yajl_tree_free(root);
+		curl_easy_cleanup(curl);
+	} else {
+		fprintf(stderr, "mod_linkinfo: xkcd curl [%s] err: %s", url, curl_easy_strerror(err));
+	}
+
+	sb_free(data);
+	free(url);
+}
+
 static void linkinfo_msg(const char* chan, const char* name, const char* msg){
 
 	regmatch_t matches[5] = {};
@@ -578,4 +656,9 @@ static void linkinfo_msg(const char* chan, const char* name, const char* msg){
 	if(regexec(&vimeo_url_regex, msg, 2, matches, 0) == 0){
 		do_vimeo_info(chan, msg, matches);
 	}
+
+	if(regexec(&xkcd_url_regex, msg, 2, matches, 0) == 0){
+		do_xkcd_info(chan, msg, matches);
+	}
+
 }

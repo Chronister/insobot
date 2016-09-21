@@ -92,8 +92,8 @@ static char*** chan_nicks;
 
 static INotifyData inotify;
 
-static struct timeval idle_time = {};
-static int ping_sent;
+static struct timeval idle_tv;
+static bool ping_sent;
 
 static int         ipc_socket;
 static IPCAddress  ipc_self;
@@ -401,6 +401,8 @@ static void util_reload_modules(const IRCCoreCtx* core_ctx){
 
 		if(!IRC_MOD_CALL(m, on_init, (core_ctx))){
 			printf("** Init failed for %s.\n", mod_name);
+			dlclose(m->lib_handle);
+			m->lib_handle = NULL;
 			sb_erase(irc_modules, m - irc_modules);
 			--m;
 			continue;
@@ -606,6 +608,7 @@ static void util_ipc_recv(void){
 
 	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
 		if(strncmp(buffer, m->ctx->name, num) == 0){
+			printf("Got IPC msg from %d for %s\n", peer->id, m->ctx->name);
 			const size_t off = strlen(m->ctx->name) + 1;
 			IRC_MOD_CALL(m, on_ipc, (peer->id, (uint8_t*)(buffer + off), num - off));
 		}
@@ -633,6 +636,14 @@ static void util_find_chan_nick(const char* chan, const char* nick, int* chan_id
 	}
 }
 
+static void util_trim_end_spaces(char* msg, size_t len){
+	if(len > 0){
+		for(char* p = msg + len - 1; *p == ' '; --p){
+			*p = 0;
+		}
+	}
+}
+
 /*****************
  * IRC Callbacks *
  *****************/
@@ -647,17 +658,10 @@ IRC_STR_CALLBACK(on_connect) {
 
 IRC_STR_CALLBACK(on_chat_msg) {
 	if(count < 2 || !params[0] || !params[1]) return;
+
 	const char *_chan = params[0], *_name = origin;
-
 	char* _msg = strdupa(params[1]);
-	size_t len = strlen(_msg);
-
-	// trim spaces at end of messages
-	if(len > 0){
-		for(char* p = _msg + len - 1; *p == ' '; --p){
-			*p = 0;
-		}
-	}
+	util_trim_end_spaces(_msg, strlen(_msg));
 
 	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){
 		bool global = m->ctx->flags & IRC_MOD_GLOBAL;
@@ -672,24 +676,27 @@ IRC_STR_CALLBACK(on_chat_msg) {
 
 IRC_STR_CALLBACK(on_action) {
 	if(count < 2 || !params[0] || !params[1]) return;
+
 	const char *_chan = params[0], *_name = origin;
-
 	char* _msg = strdupa(params[1]);
-	size_t len = strlen(_msg);
-
-	// trim spaces at end of messages
-	if(len > 0){
-		for(char* p = _msg + len - 1; *p == ' '; --p){
-			*p = 0;
-		}
-	}
+	util_trim_end_spaces(_msg, strlen(_msg));
 
 	IRC_MOD_CALL_ALL_CHECK(on_action, (_chan, _name, _msg), IRC_CB_ACTION);
 }
 
+IRC_STR_CALLBACK(on_pm){
+	if(count < 2 || !params[1] || !origin) return;
+
+	const char* _name = origin;
+	char* _msg = strdupa(params[1]);
+	util_trim_end_spaces(_msg, strlen(_msg));
+
+	IRC_MOD_CALL_ALL(on_pm, (_name, _msg));
+}
+
 IRC_STR_CALLBACK(on_join) {
 	if(count < 1 || !origin || !params[0]) return;
-	fprintf(stderr, "Join: %s %s\n", params[0], origin);
+	fprintf(stderr, "JOIN: %s %s\n", params[0], origin);
 
 	int chan_i, nick_i;
 	util_find_chan_nick(params[0], origin, &chan_i, &nick_i);
@@ -716,10 +723,9 @@ IRC_STR_CALLBACK(on_part) {
 	int chan_i, nick_i;
 	util_find_chan_nick(params[0], origin, &chan_i, &nick_i);
 
-	printf("PART: %s %s %d %d\n", params[0], origin, chan_i, nick_i);
+	printf("PART: %s %s\n", params[0], origin);
 
 	if(chan_i != -1 && strcasecmp(origin, bot_nick) == 0){
-		puts("free all nicks");
 		free(channels[chan_i]);
 		sb_erase(channels, chan_i);
 
@@ -730,7 +736,6 @@ IRC_STR_CALLBACK(on_part) {
 		sb_erase(chan_nicks, chan_i);
 
 	} else if(nick_i != -1){
-		puts("free nick");
 		free(chan_nicks[chan_i][nick_i]);
 		sb_erase(chan_nicks[chan_i], nick_i);
 	}
@@ -761,15 +766,15 @@ IRC_STR_CALLBACK(on_nick) {
 
 IRC_STR_CALLBACK(on_unknown) {
 	if(strcmp(event, "PONG") == 0){
-		timerclear(&idle_time);
-		ping_sent = 0;
+		printf(":: PONG");
 	} else {
 		printf("Unknown event:\n:: %s :: %s", event, origin);
-		for(int i = 0; i < count; ++i){
-			printf(" :: %s", params[i]);
-		}
-		puts("");
 	}
+
+	for(int i = 0; i < count; ++i){
+		printf(" :: %s", params[i]);
+	}
+	puts("");
 }
 
 IRC_NUM_CALLBACK(on_numeric) {
@@ -920,6 +925,8 @@ static void core_send_ipc(int target, const void* data, size_t data_len){
 
 	for(IPCAddress* p = ipc_peers; p < sb_end(ipc_peers); ++p){
 		if(target != 0 && p->id != target) continue;
+
+		printf("Sending IPC msg to %d for %s\n", p->id, name);
 
 		if(sendto(ipc_socket, buffer, total_len, 0, &p->addr, sizeof(p->addr)) == -1){
 			bool remove = false;
@@ -1099,6 +1106,7 @@ int main(int argc, char** argv){
 	irc_callbacks_t callbacks = {
 		.event_connect     = irc_on_connect,
 		.event_channel     = irc_on_chat_msg,
+		.event_privmsg     = irc_on_pm,
 		.event_join        = irc_on_join,
 		.event_part        = irc_on_part,
 		.event_nick        = irc_on_nick,
@@ -1161,11 +1169,12 @@ int main(int argc, char** argv){
 			struct timeval tv = {
 				.tv_sec  = 0,
 				.tv_usec = 250000,
-			};
+			}, orig_tv = tv;
 	
 			int ret = select(max_fd + 1, &in, &out, NULL, &tv);
 				
 			if(ret > 0){
+
 				if(irc_process_select_descriptors(irc_ctx, &in, &out) != 0){
 					fprintf(stderr, "Error processing select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
 				}
@@ -1182,12 +1191,41 @@ int main(int argc, char** argv){
 				if(FD_ISSET(ipc_socket, &in)){
 					util_ipc_recv();
 				}
-			} else if(ret){
+
+				for(int i = 0; i < max_fd + 1; ++i){
+					if(i != STDIN_FILENO && i != ipc_socket && FD_ISSET(i, &in)){
+						timerclear(&idle_tv);
+						ping_sent = 0;
+						break;
+					}
+				}
+
+			} else if(ret == 0){
+
+				struct timeval ping_tv    = { .tv_sec = 60 };
+				struct timeval restart_tv = { .tv_sec = 90 };
+
+				timeradd(&orig_tv, &idle_tv, &idle_tv);
+
+				if(!ping_sent && timercmp(&idle_tv, &ping_tv, >)){
+					puts("Reached idle time threshold, sending PING.");
+					irc_send_raw(irc_ctx, "PING %s", serv);
+					ping_sent = 1;
+				}
+
+				if(ping_sent && timercmp(&idle_tv, &restart_tv, >)){
+					puts("Reached 'no PONG' threshold, disconnecting."); 
+					irc_disconnect(irc_ctx);
+				}
+
+			} else {
 				perror("select");
 			}
 		}
 	
 		irc_destroy_session(irc_ctx);
+		timerclear(&idle_tv);
+		ping_sent = 0;
 	
 		if(running){
 			if(getenv("INSOBOT_NO_AUTO_RESTART")){

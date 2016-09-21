@@ -11,7 +11,7 @@ static void automod_cmd     (const char*, const char*, const char*, int);
 static bool automod_init    (const IRCCoreCtx*);
 static void automod_join    (const char*, const char*);
 static void automod_connect (const char*);
-//static void automod_quit    (void);
+static void automod_quit    (void);
 
 enum { AUTOMOD_TIMEOUT, AUTOMOD_UNBAN };
 
@@ -24,7 +24,7 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_init    = &automod_init,
 	.on_connect = &automod_connect,
 	.on_join    = &automod_join,
-//	.on_quit    = &automod_quit
+	.on_quit    = &automod_quit,
 	.commands   = DEFINE_CMDS(
 		[AUTOMOD_TIMEOUT] = "!b \\b !to !ko \\ko",
 		[AUTOMOD_UNBAN]   = "!ub \\ub"
@@ -54,6 +54,23 @@ static bool automod_init(const IRCCoreCtx* _ctx){
 	is_twitch = true;
 	regcomp(&url_regex, "https?://[^[:space:]]+", REG_ICASE | REG_EXTENDED);
 	return true;
+}
+
+static void automod_quit(void){
+	regfree(&url_regex);
+
+	for(char** c = channels; c < sb_end(channels); ++c){
+		free(*c);
+	}
+	sb_free(channels);
+
+	for(Suspect** slist = suspects; slist < sb_end(suspects); ++slist){
+		for(Suspect* s = *slist; s < sb_end(*slist); ++s){
+			free(s->name);
+		}
+		sb_free(*slist);
+	}
+	sb_free(suspects);
 }
 
 static void automod_connect(const char* serv){
@@ -201,18 +218,6 @@ static int am_score_links(const Suspect* s, const char* msg, size_t len){
 	// look for short urls as first message
 	if(url_len > 0 && url_len < 32 && !s->last_msg){
 
-		// new account?
-		if(is_twitch){
-			time_t user_created_date = 0;
-			MOD_MSG(ctx, "twitch_get_user_date", s->name, &get_user_cb, &user_created_date);
-
-			printf("twitch user time: %zu\n", (now - user_created_date));
-
-			if((now - user_created_date) < (7*24*60*60)){
-				return 100;
-			}
-		}
-
 		// has been ++'d before?
 		int karma = 0;
 		MOD_MSG(ctx, "karma_get", s->name, &get_karma_cb, &karma);
@@ -220,9 +225,16 @@ static int am_score_links(const Suspect* s, const char* msg, size_t len){
 			return 0;
 		}
 
-		// only just joined
-		if(!s->join || (now - s->join) < 60){
-			return 100;
+		// new account?
+		if(is_twitch){
+			time_t user_created_date = 0;
+			MOD_MSG(ctx, "twitch_get_user_date", s->name, &get_user_cb, &user_created_date);
+
+			printf("twitch user time: %zd\n", (now - user_created_date));
+
+			if((now - user_created_date) < (24*60*60)){
+				return 500;
+			}
 		}
 	}
 
@@ -233,7 +245,7 @@ static int am_score_flood(const Suspect* s, const char* msg, size_t len){
 	time_t now = time(0);
 
 	if((now - s->last_msg) < 5){
-		return 35;
+		return 25;
 	} else {
 		return 0;
 	}
@@ -256,7 +268,6 @@ static const char* emotes[] = {
   "BibleThump",
   "BiersDerp",
   "BigBrother",
-  "BionicBunion",
   "BlargNaut",
   "bleedPurple",
   "BloodTrail",
@@ -270,7 +281,6 @@ static const char* emotes[] = {
   "cmonBruh",
   "CoolCat",
   "CorgiDerp",
-  "CougarHunt",
   "DAESuppy",
   "DalLOVE",
   "DansGame",
@@ -281,6 +291,7 @@ static const char* emotes[] = {
   "DendiFace",
   "DogFace",
   "DOOMGuy",
+  "DoritosChip",
   "duDudu",
   "EagleEye",
   "EleGiggle",
@@ -291,7 +302,6 @@ static const char* emotes[] = {
   "FUNgineer",
   "FunRun",
   "FutureMan",
-  "FuzzyOtterOO",
   "GingerPower",
   "GrammarKing",
   "HassaanChop",
@@ -317,6 +327,8 @@ static const char* emotes[] = {
   "mcaT",
   "MikeHogu",
   "MingLee",
+  "MKXRaiden",
+  "MKXScorpion",
   "MrDestructoid",
   "MVGame",
   "NinjaTroll",
@@ -335,14 +347,13 @@ static const char* emotes[] = {
   "panicBasket",
   "PanicVis",
   "PartyTime",
-  "PazPazowitz",
   "PeoplesChamp",
   "PermaSmug",
   "PeteZaroll",
   "PeteZarollTie",
-  "PicoMause",
   "PipeHype",
   "PJSalt",
+  "PJSugar",
   "PMSTwin",
   "PogChamp",
   "Poooound",
@@ -360,13 +371,11 @@ static const char* emotes[] = {
   "SeemsGood",
   "ShadyLulu",
   "ShazBotstix",
-  "ShibeZ",
   "SmoocherZ",
   "SMOrc",
   "SMSkull",
   "SoBayed",
   "SoonerLater",
-  "SriHead",
   "SSSsss",
   "StinkyCheese",
   "StoneLightning",
@@ -392,9 +401,7 @@ static const char* emotes[] = {
   "UnSane",
   "VaultBoy",
   "VoHiYo",
-  "Volcania",
   "WholeWheat",
-  "WinWaker",
   "WTRuck",
   "WutFace",
   "YouWHY",
@@ -411,7 +418,7 @@ static int am_score_emotes(const Suspect* s, const char* msg, size_t len){
 			p += strlen(*e);
 		}
 
-		if(emote_count >= 5){
+		if(emote_count > 5){
 			break;
 		}
 	}
@@ -464,7 +471,7 @@ static void automod_msg(const char* chan, const char* name, const char* msg){
 		am_score_links
 	};
 
-	const char* rules[] = { "caps", "ascii", "flood", "emotes", "links" };
+	const char* rules[] = { "caps", "ascii art", "flood", "emotes", "spambot?" };
 
 	size_t len = strlen(msg);
 
@@ -510,9 +517,22 @@ static void automod_cmd(const char* chan, const char* name, const char* arg, int
 		char victim[32] = {};
 		int duration = 10;
 		if(sscanf(arg, "%31s %d", victim, &duration) >= 1){
-			ctx->send_msg(chan, ".timeout %s %d", victim, duration);
+			if(is_twitch){
+				ctx->send_msg(chan, ".timeout %s %d", victim, duration);
+			} else {
+				char buf[256];
+				snprintf(buf, sizeof(buf), "KICK %s %s", chan, victim);
+				ctx->send_raw(buf);
+			}
 		}
 	} else if(cmd == AUTOMOD_UNBAN){
-		ctx->send_msg(chan, ".unban %s", arg);
+		if(is_twitch){
+			ctx->send_msg(chan, ".unban %s", arg);
+		} else {
+			char buf[256];
+			char* who = strndupa(arg, strchrnul(arg, ' ') - arg);
+			snprintf(buf, sizeof(buf), "MODE %s -b %s!*@*", chan, who);
+			ctx->send_raw(buf);
+		}
 	}
 }

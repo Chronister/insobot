@@ -24,6 +24,7 @@ typedef struct IRCModuleCtx_ {
 	void (*on_connect) (const char* serv);
 	void (*on_msg)     (const char* chan, const char* name, const char* msg);
 	void (*on_action)  (const char* chan, const char* name, const char* msg);
+	void (*on_pm)      (const char* name, const char* msg);
 	void (*on_join)    (const char* chan, const char* name);
 	void (*on_part)    (const char* chan, const char* name);
 	void (*on_nick)    (const char* prev_nick, const char* new_nick);
@@ -89,12 +90,12 @@ enum {
 };
 
 // used for inter-module communication messages
-typedef struct IRCModMsg_ {
+struct IRCModMsg_ {
 	const char* cmd;
 	intptr_t    arg;
 	void        (*callback)(intptr_t result, intptr_t arg);
 	intptr_t    cb_arg;
-} IRCModMsg;
+};
 
 #define MOD_MSG(ctx, cmd, arg, cb, cb_arg) (ctx)->send_mod_msg(\
 	&(IRCModMsg){ (cmd), (intptr_t)(arg), (cb), (intptr_t)(cb_arg) }\
@@ -104,5 +105,9 @@ typedef struct IRCModMsg_ {
 	__VA_ARGS__,\
 	0\
 }
+
+#define CMD1(x) CONTROL_CHAR x " "
+#define CMD2(x) CONTROL_CHAR_2 x " "
+#define CMD(x) CMD1(x) CMD2(x)
 
 #endif

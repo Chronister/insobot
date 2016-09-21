@@ -6,6 +6,8 @@
 #include "stb_sb.h"
 #include "utils.h"
 #include <curl/curl.h>
+#include <sys/stat.h>
+#include <ctype.h>
 
 static void hmh_cmd     (const char*, const char*, const char*, int);
 static bool hmh_init    (const IRCCoreCtx*);
@@ -69,6 +71,13 @@ static bool update_schedule(void){
 
 	if(curl_ret != 0){
 		fprintf(stderr, "Error getting schedule: %s\n", curl_easy_strerror(curl_ret));
+
+		if((time(0) - mktime(&schedule_start)) > (6*24*60*60)){
+			memset(schedule, 0, sizeof(schedule));
+			schedule_start.tm_mday += DAYS_IN_WEEK;
+			mktime(&schedule_start);
+		}
+
 		sb_free(data);
 		return false;
 	}
@@ -135,8 +144,8 @@ static bool update_schedule(void){
 
 	// skip to the next week if there are no upcoming streams and it's past friday.
 	struct tm cutoff_tm = schedule_start;
-	cutoff_tm.tm_mday += FRI;
-	cutoff_tm.tm_hour = 17;
+	cutoff_tm.tm_mday += SAT;
+	cutoff_tm.tm_hour = 0;
 	cutoff_tm.tm_min = 0;
 	cutoff_tm.tm_isdst = -1;
 	time_t cutoff = mktime(&cutoff_tm);
@@ -154,7 +163,7 @@ static bool update_schedule(void){
 	return true;
 }
 
-static void print_schedule(const char* chan, const char* name){
+static void print_schedule(const char* chan, const char* name, const char* arg){
 	time_t now = time(0);
 
 	bool empty_sched = true;
@@ -168,7 +177,12 @@ static void print_schedule(const char* chan, const char* name){
 	const size_t lim = empty_sched ? 30 : 1800;
 
 	if(now - last_schedule_update > lim){
-		if(update_schedule()) last_schedule_update = now;
+		if(update_schedule()){
+			last_schedule_update = now;
+		} else if(schedule_start.tm_year == 0){
+			ctx->send_msg(chan, "Error retrieving schedule :(");
+			return;
+		}
 	}
 
 	//FIXME: None of this crap should be done here, do it in update_schedule!
@@ -182,9 +196,52 @@ static void print_schedule(const char* chan, const char* name){
 	} times[DAYS_IN_WEEK] = {};
 
 	int time_count = 0;
-
-	char* tz = tz_push(":US/Pacific");
+	int prev_bucket = -1;
+	bool terse = false;
 	
+	if(*arg == ' ' && strncasecmp(arg + 1, "terse", 5) == 0){
+		terse = true;
+		arg += 6;
+	}
+
+	char* tz;
+	if(*arg++ == ' '){
+		char timezone[64] = ":";
+		inso_strcat(timezone, sizeof(timezone), arg);
+
+		char* p = timezone + 1;
+		for(char* p2 = p; *p2; ++p2) *p2 = tolower(*p2);
+		*p = toupper(*p);
+
+		if(strchr(p, '/')){
+			while((p = strchr(p, '/'))){
+				++p;
+				*p = toupper(*p);
+			}
+		} else {
+			while(*++p) *p = toupper(*p);
+		}
+
+		bool valid = false;
+		if(!strchr(timezone + 1, '.') && strcmp(timezone + 1, "Factory") != 0){
+			char tz_path[128] = "/usr/share/zoneinfo/posix/";
+			inso_strcat(tz_path, sizeof(tz_path), timezone + 1);
+
+			struct stat st;
+			if(stat(tz_path, &st) == 0 && S_ISREG(st.st_mode)){
+				tz = tz_push(timezone);
+				valid = true;
+			}
+		}
+
+		if(!valid){
+			ctx->send_msg(chan, "%s: Unknown timezone.", name);
+			return;
+		}
+	} else {
+		tz = tz_push(":US/Pacific");
+	}
+
 	// group days by equal times
 	for(int i = 0; i < DAYS_IN_WEEK; ++i){
 		struct tm lt = {};
@@ -197,10 +254,16 @@ static void print_schedule(const char* chan, const char* name){
 		
 		int time_bucket = -1;
 
-		for(int j = 0; j < time_count; ++j){
-			if(lt.tm_hour == times[j].hour && lt.tm_min == times[j].min){
-				time_bucket = j;
-				break;
+		if(terse){
+			for(int j = 0; j < time_count; ++j){
+				if(lt.tm_hour == times[j].hour && lt.tm_min == times[j].min){
+					time_bucket = j;
+					break;
+				}
+			}
+		} else {
+			if(prev_bucket != -1 && lt.tm_hour == times[prev_bucket].hour && lt.tm_min == times[prev_bucket].min){
+				time_bucket = prev_bucket;
 			}
 		}
 
@@ -211,6 +274,8 @@ static void print_schedule(const char* chan, const char* name){
 		}
 
 		times[time_bucket].bits |= (1 << i);
+
+		prev_bucket = time_bucket;
 	}
 
 	empty_sched = true;
@@ -239,6 +304,7 @@ static void print_schedule(const char* chan, const char* name){
 	}
 
 	char prefix[64], suffix[64];
+	mktime(&schedule_start);
 	strftime(prefix, sizeof(prefix), "%b %d", &schedule_start);
 	strftime(suffix, sizeof(suffix), "%Z/UTC%z", &schedule_start);
 	
@@ -274,7 +340,12 @@ static void print_time(const char* chan, const char* name){
 	time_t now = time(0);
 
 	if(now - last_schedule_update > 1800){
-		if(update_schedule()) last_schedule_update = now;
+		if(update_schedule()){
+			last_schedule_update = now;
+		} else if(schedule_start.tm_year == 0){
+			ctx->send_msg(chan, "Error retrieving time :(");
+			return;
+		}
 	}
 
 	enum { SCHED_UNKNOWN = 0, SCHED_OFF = (1 << 0), SCHED_OLD = (1 << 1) };
@@ -367,11 +438,11 @@ static void print_time(const char* chan, const char* name){
 	}
 }
 
-static void hmh_cmd(const char* chan, const char* name, const char* msg, int cmd){
+static void hmh_cmd(const char* chan, const char* name, const char* arg, int cmd){
 
 	switch(cmd){
 		case CMD_SCHEDULE: {
-			print_schedule(chan, name);
+			print_schedule(chan, name, arg);
 		} break;
 
 		case CMD_TIME: {
