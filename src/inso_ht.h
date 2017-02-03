@@ -1,18 +1,13 @@
 #ifndef INSO_HT_H_
 #define INSO_HT_H_
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <assert.h>
 
-#ifdef INSO_HT_SPLIT
-	#define INSO_HT_DECL
-#else
-	#define INSO_HT_DECL static inline
-#endif
-
 // Interface
 
-// TODO: custom memory allocators
 typedef struct {
 	size_t capacity;
 	size_t prev_cap;
@@ -22,9 +17,14 @@ typedef struct {
 	size_t (*hash_fn)(const void*);
 	char*  memory;
 	char*  prev_memory;
+
+	// set these manually before init if you want custom allocation
+	void* (*alloc_fn)(size_t);
+	void  (*free_fn)(void*, size_t);
 } inso_ht;
 
 #ifndef NDEBUG
+	#include <stdio.h>
 	#define INSO_HT_DBG(fmt, ...) printf(fmt, ##__VA_ARGS__);
 #else
 	#define INSO_HT_DBG(fmt, ...)
@@ -33,23 +33,25 @@ typedef struct {
 typedef size_t (*inso_ht_hash_fn) (const void* entry);
 typedef bool   (*inso_ht_cmp_fn)  (const void* entry, void* param);
 
-INSO_HT_DECL void  inso_ht_init (inso_ht*, size_t nmemb, size_t size, inso_ht_hash_fn);
-INSO_HT_DECL void  inso_ht_free (inso_ht*);
-INSO_HT_DECL void* inso_ht_put  (inso_ht*, const void* elem);
-INSO_HT_DECL void* inso_ht_get  (inso_ht*, size_t hash, inso_ht_cmp_fn, void* param);
-INSO_HT_DECL bool  inso_ht_del  (inso_ht*, size_t hash, inso_ht_cmp_fn, void* param);
-INSO_HT_DECL bool  inso_ht_tick (inso_ht*);
+void  inso_ht_init (inso_ht*, size_t nmemb, size_t size, inso_ht_hash_fn);
+void  inso_ht_free (inso_ht*);
+void* inso_ht_put  (inso_ht*, const void* elem);
+void* inso_ht_get  (inso_ht*, size_t hash, inso_ht_cmp_fn, void* param);
+bool  inso_ht_del  (inso_ht*, size_t hash, inso_ht_cmp_fn, void* param);
+bool  inso_ht_tick (inso_ht*);
+
+#endif
 
 // Implementation
 
-#if !defined(INSO_HT_SPLIT) || defined(INSO_HT_IMPL)
+#ifdef INSO_IMPL
 
-INSO_HT_DECL void*  inso_htpriv_put   (inso_ht*, const void*);
-INSO_HT_DECL bool   inso_htpriv_get_i (inso_ht*, intptr_t*, size_t, inso_ht_cmp_fn, void*);
-INSO_HT_DECL void   inso_htpriv_del_i (inso_ht*, intptr_t);
-INSO_HT_DECL size_t inso_htpriv_align (size_t);
+void*  inso_htpriv_put   (inso_ht*, const void*);
+bool   inso_htpriv_get_i (inso_ht*, intptr_t*, size_t, inso_ht_cmp_fn, void*);
+void   inso_htpriv_del_i (inso_ht*, intptr_t);
+size_t inso_htpriv_align (size_t);
 
-INSO_HT_DECL void inso_ht_init(inso_ht* ht, size_t nmemb, size_t size, inso_ht_hash_fn hash_fn){
+void inso_ht_init(inso_ht* ht, size_t nmemb, size_t size, inso_ht_hash_fn hash_fn){
 	assert(ht);
 	memset(ht, 0, sizeof(*ht));
 
@@ -58,24 +60,40 @@ INSO_HT_DECL void inso_ht_init(inso_ht* ht, size_t nmemb, size_t size, inso_ht_h
 	ht->capacity  = size * nmemb;
 	ht->elem_size = size;
 	ht->hash_fn   = hash_fn;
-	ht->memory    = calloc(ht->capacity, 1);
+
+	if(ht->alloc_fn && ht->free_fn){
+		ht->memory = ht->alloc_fn(ht->capacity);
+	} else {
+		ht->memory = calloc(ht->capacity, 1);
+	}
 
 	INSO_HT_DBG("ht_init: nmemb: %zu, cap: %zu\n", nmemb, ht->capacity);
 
 	assert(ht->memory);
 }
 
-INSO_HT_DECL void inso_ht_free(inso_ht* ht){
+void inso_ht_free(inso_ht* ht){
 	if(ht && ht->memory){
-		free(ht->memory);
+		bool custom = ht->alloc_fn && ht->free_fn;
+
+		if(custom){
+			ht->free_fn(ht->memory, ht->capacity);
+		} else {
+			free(ht->memory);
+		}
+
 		if(ht->prev_memory){
-			free(ht->prev_memory);
+			if(custom){
+				ht->free_fn(ht->prev_memory, ht->prev_cap);
+			} else {
+				free(ht->prev_memory);
+			}
 		}
 	}
 	memset(ht, 0, sizeof(*ht));
 }
 
-INSO_HT_DECL void* inso_ht_put(inso_ht* ht, const void* elem){
+void* inso_ht_put(inso_ht* ht, const void* elem){
 	assert(ht);
 	assert(ht->memory);
 	inso_ht_tick(ht);
@@ -87,9 +105,14 @@ INSO_HT_DECL void* inso_ht_put(inso_ht* ht, const void* elem){
 		ht->prev_cap    = ht->capacity;
 		ht->capacity   *= 2;
 		ht->prev_memory = ht->memory;
-		ht->memory      = calloc(ht->capacity, 1);
 		ht->rehash_idx  = 0;
 		ht->used        = 0;
+		
+		if(ht->alloc_fn && ht->free_fn){
+			ht->memory = ht->alloc_fn(ht->capacity);
+		} else {
+			ht->memory = calloc(ht->capacity, 1);
+		}
 
 		INSO_HT_DBG("ht_put: expanding table. %zu -> %zu\n", ht->prev_cap, ht->capacity);
 
@@ -100,7 +123,7 @@ INSO_HT_DECL void* inso_ht_put(inso_ht* ht, const void* elem){
 }
 
 
-INSO_HT_DECL void* inso_ht_get(inso_ht* ht, size_t hash, inso_ht_cmp_fn cmp, void* param){
+void* inso_ht_get(inso_ht* ht, size_t hash, inso_ht_cmp_fn cmp, void* param){
 	assert(ht);
 	assert(ht->memory);
 	inso_ht_tick(ht);
@@ -120,7 +143,7 @@ INSO_HT_DECL void* inso_ht_get(inso_ht* ht, size_t hash, inso_ht_cmp_fn cmp, voi
 	return NULL;
 }
 
-INSO_HT_DECL bool inso_ht_del(inso_ht* ht, size_t hash, inso_ht_cmp_fn cmp, void* param){
+bool inso_ht_del(inso_ht* ht, size_t hash, inso_ht_cmp_fn cmp, void* param){
 	assert(ht);
 	assert(ht->memory);
 	inso_ht_tick(ht);
@@ -134,7 +157,7 @@ INSO_HT_DECL bool inso_ht_del(inso_ht* ht, size_t hash, inso_ht_cmp_fn cmp, void
 	return false;
 }
 
-INSO_HT_DECL bool inso_ht_tick(inso_ht* ht){
+bool inso_ht_tick(inso_ht* ht){
 	if(!ht->prev_memory) return false;
 
 	size_t cap = ht->prev_cap / ht->elem_size;
@@ -154,7 +177,11 @@ INSO_HT_DECL bool inso_ht_tick(inso_ht* ht){
 	}
 
 	if(i >= cap){
-		free(ht->prev_memory);
+		if(ht->alloc_fn && ht->free_fn){
+			ht->free_fn(ht->prev_memory, ht->prev_cap);
+		} else {
+			free(ht->prev_memory);
+		}
 		ht->prev_memory = NULL;
 		INSO_HT_DBG("done rehashing table.\n");
 	}
@@ -164,7 +191,7 @@ INSO_HT_DECL bool inso_ht_tick(inso_ht* ht){
 
 //////////////////////////////////
 
-INSO_HT_DECL void* inso_htpriv_put(inso_ht* ht, const void* elem){
+void* inso_htpriv_put(inso_ht* ht, const void* elem){
 
 	// TODO: robin-hood hashing?
 
@@ -194,7 +221,7 @@ INSO_HT_DECL void* inso_htpriv_put(inso_ht* ht, const void* elem){
 // TODO: i think the negative index == in secondary table was a bad idea, just make this rehash
 // and return the new index?
 
-INSO_HT_DECL bool
+bool
 inso_htpriv_get_i(inso_ht* ht, intptr_t* idx, size_t hash, inso_ht_cmp_fn cmp, void* param){
 
 	char*  mem[] = { ht->memory   , ht->prev_memory };
@@ -225,7 +252,7 @@ inso_htpriv_get_i(inso_ht* ht, intptr_t* idx, size_t hash, inso_ht_cmp_fn cmp, v
 	return false;
 }
 
-INSO_HT_DECL void
+void
 inso_htpriv_del_i(inso_ht* ht, intptr_t idx){
 
 	if(idx < 0){
@@ -274,10 +301,9 @@ inso_htpriv_del_i(inso_ht* ht, intptr_t idx){
 	assert(!"ht_del: not found and no empty slots? wtf");
 }
 
-INSO_HT_DECL size_t inso_htpriv_align(size_t i){
+size_t inso_htpriv_align(size_t i){
 	size_t shift = __builtin_clzl(i - 1) ^ (__WORDSIZE - 1);
 	return UINTMAX_C(1) << ++shift;
 }
 
-#endif
 #endif

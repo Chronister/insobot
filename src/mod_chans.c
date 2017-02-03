@@ -3,7 +3,7 @@
 #include "module.h"
 #include "config.h"
 #include "stb_sb.h"
-#include "utils.h"
+#include "inso_utils.h"
 
 static bool chans_init    (const IRCCoreCtx* ctx);
 static void chans_cmd     (const char*, const char*, const char*, int);
@@ -131,10 +131,23 @@ static bool chans_save(FILE* file){
 	return true;
 }
 
+static bool chans_find(const char* chan){
+	for(int i = 0; i < sb_count(join_list); ++i){
+		if(strcasecmp(chan, join_list[i]) == 0){
+			return true;
+		}
+	}
+	return false;
+}
+
 static void chans_connect(const char* serv){
 
 	if(strcasecmp(serv, "irc.chat.twitch.tv") == 0 || getenv("IRC_IS_TWITCH")){
 		ctx->send_raw("CAP REQ :twitch.tv/membership");
+
+		if(ctx->get_info(IRC_INFO_CAN_PARSE_TAGS)){
+			ctx->send_raw("CAP REQ :twitch.tv/tags");
+		}
 	}
 
 	char* nspass = getenv("IRC_NICKSERV_PASS");
@@ -149,8 +162,10 @@ static void chans_connect(const char* serv){
 	     *c = strtok_r(channels, ", ", &state);
 
 	do {
-		printf("mod_chans: Joining %s (env)\n", c);
-		sb_push(join_list, strdup(c));
+		if(!chans_find(c)){
+			printf("mod_chans: Joining %s (env)\n", c);
+			sb_push(join_list, strdup(c));
+		}
 	} while((c = strtok_r(NULL, ", ", &state)));
 
 	free(channels);
@@ -159,8 +174,10 @@ static void chans_connect(const char* serv){
 
 	FILE* f = fopen(ctx->get_datafile(), "rb");
 	while(fscanf(f, "%255s", file_chan) == 1){
-		printf("mod_chans: Joining %s (file)\n", file_chan);
-		sb_push(join_list, strdup(file_chan));
+		if(!chans_find(file_chan)){
+			printf("mod_chans: Joining %s (file)\n", file_chan);
+			sb_push(join_list, strdup(file_chan));
+		}
 	}
 	fclose(f);
 

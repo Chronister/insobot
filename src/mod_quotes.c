@@ -1,21 +1,14 @@
-#include "module.h"
-#include <curl/curl.h>
-#include "stb_sb.h"
 #include <time.h>
 #include <string.h>
-#include <yajl/yajl_tree.h>
-#include <yajl/yajl_gen.h>
 #include <ctype.h>
-#include <sys/types.h>
-#include <sys/ipc.h>
-#include <sys/sem.h>
-#include <errno.h>
-#include "utils.h"
+#include "module.h"
+#include "stb_sb.h"
+#include "inso_utils.h"
+#include "inso_gist.h"
 
 static bool quotes_init     (const IRCCoreCtx*);
 static void quotes_modified (void);
 static void quotes_cmd      (const char*, const char*, const char*, int);
-static bool quotes_save     (FILE*);
 static void quotes_quit     (void);
 static void quotes_ipc      (int, const uint8_t*, size_t);
 
@@ -27,31 +20,24 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_init     = &quotes_init,
 	.on_modified = &quotes_modified,
 	.on_cmd      = &quotes_cmd,
-	.on_save     = &quotes_save,
 	.on_quit     = &quotes_quit,
 	.on_ipc      = &quotes_ipc,
 	.commands    = DEFINE_CMDS (
-		[GET_QUOTE]     = CONTROL_CHAR"q    "CONTROL_CHAR"quote",
-		[ADD_QUOTE]     = CONTROL_CHAR"qadd "CONTROL_CHAR"q+ " CONTROL_CHAR"addquote",
-		[DEL_QUOTE]     = CONTROL_CHAR"qdel "CONTROL_CHAR"q- " CONTROL_CHAR"delquote",
-		[FIX_QUOTE]     = CONTROL_CHAR"qfix "CONTROL_CHAR"qmv "      CONTROL_CHAR"fixquote",
-		[FIX_TIME]      = CONTROL_CHAR"qft  "CONTROL_CHAR"qfixtime " CONTROL_CHAR"fixquotetime",
-		[LIST_QUOTES]   = CONTROL_CHAR"ql   "CONTROL_CHAR"qlist",
-		[SEARCH_QUOTES] = CONTROL_CHAR"qs   "CONTROL_CHAR"qsearch "  CONTROL_CHAR"qfind " CONTROL_CHAR"qgrep " CONTROL_CHAR"sq",
-		[GET_RANDOM]    = CONTROL_CHAR "qr "   CONTROL_CHAR "qrand "   CONTROL_CHAR "qrandom " CONTROL_CHAR"rq"
+		[GET_QUOTE]     = CMD1"q    "CMD1"quote",
+		[ADD_QUOTE]     = CMD1"qadd "CMD1"q+ " CMD1"addquote",
+		[DEL_QUOTE]     = CMD1"qdel "CMD1"q- " CMD1"delquote",
+		[FIX_QUOTE]     = CMD1"qfix "CMD1"qmv "      CMD1"fixquote",
+		[FIX_TIME]      = CMD1"qft  "CMD1"qfixtime " CMD1"fixquotetime",
+		[LIST_QUOTES]   = CMD1"ql   "CMD1"qlist",
+		[SEARCH_QUOTES] = CMD1"qs   "CMD1"qsearch "  CMD1"qfind " CMD1"qgrep " CMD1"sq",
+		[GET_RANDOM]    = CMD1 "qr "   CMD1 "qrand "   CMD1 "qrandom " CMD1"rq"
 	)
 };
 
 static const IRCCoreCtx* ctx;
 
-static char* gist_auth;
-static char* gist_api_url;
+static inso_gist* gist;
 static char* gist_pub_url;
-static char* gist_etag;
-
-static int quotes_sem;
-static struct sembuf quotes_lock   = { .sem_op = -1, .sem_flg = SEM_UNDO };
-static struct sembuf quotes_unlock = { .sem_op = 1 , .sem_flg = SEM_UNDO };
 
 typedef struct Quote_ {
 	uint32_t id;
@@ -61,13 +47,6 @@ typedef struct Quote_ {
 
 static char** channels;
 static Quote** chan_quotes;
-
-static bool quotes_dirty;
-
-// XXX: this is a bit of a hack
-static Quote* delete_chan_ptr;
-
-static CURL* curl;
 
 static char* gen_escaped_csv(Quote* quotes){
 	char* csv = NULL;
@@ -180,127 +159,65 @@ static void quotes_free(void){
 
 static void quotes_quit(void){
 	quotes_free();
-
-	curl_easy_cleanup(curl);
-
-	free(gist_auth);
-	free(gist_api_url);
+	inso_gist_close(gist);
 	free(gist_pub_url);
-	free(gist_etag);
 }
 
-static size_t curl_header_cb(char* buffer, size_t size, size_t nelem, void* arg){
-	char* etag;
-	if(buffer && sscanf(buffer, "ETag:%*[^\"]%m[^\r\n]", &etag) == 1){
-		if(gist_etag) free(gist_etag);
-		printf("mod_quotes: ETag: %s\n", etag);
-		gist_etag = etag;
+static void quotes_upload(int modified_index){
+	inso_gist_file* file = NULL;
+	inso_gist_file_add(&file, " Quote List", "Here are the quotes stored by insobot, in csv format, one file per channel. Times are UTC.");
+
+	if(modified_index == -1){ // full upload
+		for(int i = 0; i < sb_count(channels); ++i){
+			if(sb_count(chan_quotes[i]) == 0){
+				inso_gist_file_add(&file, channels[i], NULL);
+			} else {
+				char* csv = gen_escaped_csv(chan_quotes[i]);
+				inso_gist_file_add(&file, channels[i], csv);
+				sb_free(csv);
+			}
+		}
+	} else { // single file upload
+		if(sb_count(chan_quotes[modified_index]) == 0){
+			inso_gist_file_add(&file, channels[modified_index], NULL);
+		} else {
+			char* csv = gen_escaped_csv(chan_quotes[modified_index]);
+			inso_gist_file_add(&file, channels[modified_index], csv);
+			sb_free(csv);
+		}
 	}
-	return size * nelem;
+
+	inso_gist_save(gist, "IRC quotes", file);
+	inso_gist_file_free(file);
 }
 
 static bool quotes_reload(void){
+	inso_gist_file* files = NULL;
+	int ret = inso_gist_load(gist, &files);
 
-	char* data = NULL;
-	
-	inso_curl_reset(curl, gist_api_url, &data);
-	curl_easy_setopt(curl, CURLOPT_USERPWD, gist_auth);
-	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &curl_header_cb);
-
-	struct curl_slist* slist = NULL;
-	if(gist_etag){
-		char* h;
-		asprintf_check(&h, "If-None-Match: %s", gist_etag);
-		slist = curl_slist_append(NULL, h);
-
-		free(h);
-
-		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
-	}
-
-	CURLcode ret = curl_easy_perform(curl);
-
-	if(slist){
-		curl_slist_free_all(slist);
-	}
-
-	long http_code = 0;
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-	if(ret != 0){
-		printf("CURL returned %d, %s\n", ret, curl_easy_strerror(ret));
-		return false;
-	}
-
-	if(http_code == 304){
-		sb_free(data);
+	if(ret == INSO_GIST_304){
+		puts("mod_quotes: not modified.");
 		return true;
 	}
 
-	if(http_code != 200){
-		printf("mod_quotes: bad response [%ld]\n", http_code);
-		sb_free(data);
+	if(ret != INSO_GIST_OK){
+		puts("mod_quotes: gist error.");
 		return false;
 	}
 
 	puts("mod_quotes: doing full reload");
 
-	const char* files_path[]   = { "files",   NULL };
-	const char* content_path[] = { "content", NULL };
-
-	sb_push(data, 0);
-	yajl_val root = yajl_tree_parse(data, NULL, 0);
-	sb_free(data);
-
-	if(!YAJL_IS_OBJECT(root)){
-		fprintf(stderr, "mod_quotes: error getting root object\n");
-		return false;
-	}
-
-	yajl_val files = yajl_tree_get(root, files_path, yajl_t_object);
-	if(!files){
-		fprintf(stderr, "mod_quotes: error getting files object\n");
-		yajl_tree_free(root);
-		return false;
-	}
-
 	quotes_free();
 
-	for(size_t i = 0; i < files->u.object.len; ++i){
-		const char* filename = files->u.object.keys[i];
+	for(inso_gist_file* f = files; f; f = f->next){
+		if(!f->name || f->name[0] != '#') continue;
 
-		if(!filename || filename[0] != '#') continue;
-
-		yajl_val file = files->u.object.values[i];
-		if(!YAJL_IS_OBJECT(file)){
-			fprintf(stderr, "mod_quotes: error getting file object\n");
-			break;
-		}
-
-		yajl_val content = yajl_tree_get(file, content_path, yajl_t_string);
-		if(!content){
-			fprintf(stderr, "mod_quotes: error getting content string\n");
-			break;
-		}
-
-		sb_push(channels, strdup(filename));
+		sb_push(channels, strdup(f->name));
 		sb_push(chan_quotes, 0);
-
-		load_csv(content->u.string, &sb_last(chan_quotes));
+		load_csv(f->content, &sb_last(chan_quotes));
 	}
 
-/*
-	for(size_t i = 0; i < sb_count(channels); ++i){
-		Quote* q = chan_quotes[i];
-
-		printf("%s\n", channels[i]);
-
-		for(size_t j = 0; j < sb_count(q); ++j){
-			printf("\t%d, %lu, %s\n", q[j].id, q[j].timestamp, q[j].text);
-		}
-	}
-*/
-	yajl_tree_free(root);
+	inso_gist_file_free(files);
 
 	return true;
 }
@@ -326,33 +243,9 @@ static bool quotes_init(const IRCCoreCtx* _ctx){
 		return false;
 	}
 
-	asprintf_check(&gist_auth, "%s:%s", gist_user, gist_token);
-	asprintf_check(&gist_api_url, "https://api.github.com/gists/%s", gist_id);
 	asprintf_check(&gist_pub_url, "https://gist.github.com/%s", gist_id);
 
-	char keybuf[9] = {};
-	memcpy(keybuf, gist_id, 8);
-	key_t key = strtoul(keybuf, NULL, 16);
-
-	int setup_sem = 1;
-	int sem_flags = IPC_CREAT | IPC_EXCL | 0666;
-	while((quotes_sem = semget(key, 1, sem_flags)) == -1){
-		if(errno == EEXIST){
-			sem_flags &= ~IPC_EXCL;
-			setup_sem = 0;
-		} else {
-			perror("semget");
-			break;
-		}
-	}
-
-	if(setup_sem){
-		if((semctl(quotes_sem, 0, SETVAL, 1) == -1)){
-			perror("semctl");
-		}
-	}
-
-	curl = curl_easy_init();
+	gist = inso_gist_open(gist_id, gist_user, gist_token);
 
 	return quotes_reload();
 }
@@ -448,43 +341,54 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 	bool is_wlist = inso_is_wlist(ctx, name);
 	bool has_cmd_perms = strcasecmp(chan+1, name) == 0 || is_wlist;
 
-	bool empty_arg = !*arg++;
+	bool empty_arg = !*arg;
+	if(!empty_arg) ++arg;
 
-	semop(quotes_sem, &quotes_lock, 1);
-
+	inso_gist_lock(gist);
 	quotes_reload();
 
 	bool same_chan;
 	Quote** quotes;
+
 	const char* quote_chan = quotes_get_chan(chan, &arg, &quotes, &same_chan);
+
+	name = inso_dispname(ctx, name);
 
 	switch(cmd){
 		case GET_QUOTE: {
-			if(empty_arg){
-				ctx->send_msg(chan, "%s: Usage: \\q <id>", name);
+			if(!empty_arg){
+				char* end;
+				int id = strtol(arg, &end, 0);
+				if(end == arg || id < 0){
+					ctx->send_msg(chan, "%s: Quotes start at id 0.", name);
+					break;
+				}
+
+				Quote* q = quote_get(quote_chan, id);
+				if(q){
+					ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", id, q->text, quote_chan+1, quote_strtime(q));
+				} else {
+					ctx->send_msg(chan, "%s: Can't find that quote.", name);
+				}
+				break;
+			}
+		} // fall-through
+
+		case GET_RANDOM: {
+			if(!sb_count(*quotes)){
+				ctx->send_msg(chan, "%s: No quotes found.", name);
 				break;
 			}
 
-			char* end;
-			int id = strtol(arg, &end, 0);
-			if(end == arg || id < 0){
-				ctx->send_msg(chan, "%s: Quotes start at id 0.", name);
-				break;
-			}
-
-			Quote* q = quote_get(quote_chan, id);
-			if(q){
-				ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", id, q->text, quote_chan+1, quote_strtime(q));
-			} else {
-				ctx->send_msg(chan, "%s: Can't find that quote.", name);
-			}
+			Quote* q = *quotes + (rand() % sb_count(*quotes));
+			ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", q->id, q->text, quote_chan+1, quote_strtime(q));
 		} break;
 
 		case ADD_QUOTE: {
 			if(!has_cmd_perms) break;
 
 			if(empty_arg){
-				ctx->send_msg(chan, "%s: Usage: \\qadd <text>", name);
+				ctx->send_msg(chan, "%s: Usage: " CONTROL_CHAR "qadd <text>", name);
 				break;
 			}
 
@@ -507,18 +411,17 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 
 			// notify other instances so they can also send messages to the affected channel
 			char ipc_buf[256];
-			int ipc_len = snprintf(ipc_buf, sizeof(ipc_buf), "ADD %d %s %s", id, name, quote_chan);
+			int ipc_len = snprintf(ipc_buf, sizeof(ipc_buf), "ADD %d %s %s", id, quote_chan, name);
 			ctx->send_ipc(0, ipc_buf, ipc_len + 1);
 
-			quotes_dirty = true;
-			ctx->save_me();
+			quotes_upload(quotes - chan_quotes);
 		} break;
 
 		case DEL_QUOTE: {
 			if(!has_cmd_perms) break;
 
 			if(empty_arg){
-				ctx->send_msg(chan, "%s: Usage: \\qdel <id>", name);
+				ctx->send_msg(chan, "%s: Usage: " CONTROL_CHAR "qdel <id>", name);
 				break;
 			}
 
@@ -535,14 +438,11 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 
 			Quote* q = quote_get(quote_chan, id);
 			if(q){
+				free(q->text);
 				int off = q - *quotes;
 				sb_erase(*quotes, off);
 				ctx->send_msg(chan, "%s: Deleted quote %d\n", name, id);
-				quotes_dirty = true;
-				if(sb_count(*quotes) == 0){
-					delete_chan_ptr = *quotes;
-				}
-				ctx->save_me();
+				quotes_upload(quotes - chan_quotes);
 			} else {
 				ctx->send_msg(chan, "%s: Can't find that quote.", name);
 			}
@@ -552,7 +452,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			if(!has_cmd_perms) break;
 
 			if(empty_arg){
-				ctx->send_msg(chan, "%s: Usage: \\qfix <id> <new_text>", name);
+				ctx->send_msg(chan, "%s: Usage: " CONTROL_CHAR "qfix <id> <new_text>", name);
 				break;
 			}
 
@@ -567,7 +467,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 				break;
 			}
 			if(arg2[0] != ' ' || !arg2[1]){
-				ctx->send_msg(chan, "%s: Usage: \\qfix <id> <new_text>", name);
+				ctx->send_msg(chan, "%s: Usage: " CONTROL_CHAR "qfix <id> <new_text>", name);
 				break;
 			}
 
@@ -576,8 +476,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 				free(q->text);
 				q->text = strdup(arg2 + 1);
 				ctx->send_msg(chan, "%s: Updated quote %d.", name, id);
-				quotes_dirty = true;
-				ctx->save_me();
+				quotes_upload(quotes - chan_quotes);
 			} else {
 				ctx->send_msg(chan, "%s: Can't find that quote.", name);
 			}
@@ -587,7 +486,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			if(!has_cmd_perms) break;
 
 			if(empty_arg){
-				ctx->send_msg(chan, "%s: Usage: \\qft <id> <YYYY-MM-DD hh:mm:ss>", name);
+				ctx->send_msg(chan, "%s: Usage: " CONTROL_CHAR "qft <id> <YYYY-MM-DD hh:mm:ss>", name);
 				break;
 			}
 
@@ -602,7 +501,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 				break;
 			}
 			if(arg2[0] != ' ' || !arg2[1]){
-				ctx->send_msg(chan, "%s: Usage: \\qft <id> <YYYY-MM-DD hh:mm:ss>", name);
+				ctx->send_msg(chan, "%s: Usage: " CONTROL_CHAR "qft <id> <YYYY-MM-DD hh:mm:ss>", name);
 				break;
 			}
 
@@ -617,8 +516,7 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 			if(ret){
 				q->timestamp = timegm(&timestamp);
 				ctx->send_msg(chan, "%s: Updated quote %d's timestamp successfully.", name, id);
-				quotes_dirty = true;
-				ctx->save_me();
+				quotes_upload(quotes - chan_quotes);
 			} else {
 				ctx->send_msg(chan, "%s: Sorry, I don't understand that timestamp. Use YYYY-MM-DD hh:mm:ss", name);
 			}
@@ -689,132 +587,26 @@ static void quotes_cmd(const char* chan, const char* name, const char* arg, int 
 					ctx->send_msg(chan, "%s: Matching quotes: %s", name, msg_buf);
 				}
 			} else {
-				ctx->send_msg(chan, "%s: No matches.", name);
+				ctx->send_msg(chan, "%s: No matches for '%s'.", name, arg);
 			}
 
 		} break;
-
-		case GET_RANDOM: {
-			if(!sb_count(*quotes)){
-				ctx->send_msg(chan, "%s: No quotes found.", name);
-				break;
-			}
-
-			Quote* q = *quotes + (rand() % sb_count(*quotes));
-			ctx->send_msg(chan, "Quote %d: \"%s\" ―%s %s", q->id, q->text, quote_chan+1, quote_strtime(q));
-		}
 	}
 
-	semop(quotes_sem, &quotes_unlock, 1);
-}
-
-static const char desc_key[]    = "description";
-static const char desc_val[]    = "IRC quotes";
-static const char files_key[]   = "files";
-static const char content_key[] = "content";
-static const char readme_key[]  = " Quote List";
-static const char readme_val[]  =
-"Here are the quotes stored by insobot, in csv format, one file per channel. Times are UTC.";
-
-static bool quotes_save(FILE* file){
-	if(!quotes_dirty) return false;
-
-	yajl_gen json = yajl_gen_alloc(NULL);
-
-	yajl_gen_map_open(json);
-
-	yajl_gen_string(json, desc_key, sizeof(desc_key) - 1);
-	yajl_gen_string(json, desc_val, sizeof(desc_val) - 1);
-	yajl_gen_string(json, files_key, sizeof(files_key) - 1);
-
-	yajl_gen_map_open(json);
-
-	yajl_gen_string(json, readme_key, sizeof(readme_key) - 1);
-
-	yajl_gen_map_open(json);
-	yajl_gen_string(json, content_key, sizeof(content_key) - 1);
-	yajl_gen_string(json, readme_val, sizeof(readme_val) - 1);
-	yajl_gen_map_close(json);
-
-	for(int i = 0; i < sb_count(channels); ++i){
-		if(sb_count(chan_quotes[i]) == 0){
-			if(chan_quotes[i] && chan_quotes[i] == delete_chan_ptr){
-				puts("DELETING");
-				yajl_gen_string(json, channels[i], strlen(channels[i]));
-				yajl_gen_null(json);
-				delete_chan_ptr = NULL;
-			}
-		} else {
-			yajl_gen_string(json, channels[i], strlen(channels[i]));
-
-			yajl_gen_map_open(json);
-
-			yajl_gen_string(json, content_key, sizeof(content_key) - 1);
-
-			char* csv = gen_escaped_csv(chan_quotes[i]);
-			yajl_gen_string(json, csv, strlen(csv));
-			sb_free(csv);
-
-			yajl_gen_map_close(json);
-		}
-	}
-
-	yajl_gen_map_close(json);
-	yajl_gen_map_close(json);
-
-	size_t len = 0;
-	const unsigned char* payload = NULL;
-
-	yajl_gen_get_buf(json, &payload, &len);
-	//printf("Payload: [%zu] [%s]\n", len, payload);
-
-	char* data = NULL;
-
-	struct curl_slist* slist = curl_slist_append(NULL, "Content-Type: application/json");
-
-	inso_curl_reset(curl, gist_api_url, &data);
-	curl_easy_setopt(curl, CURLOPT_USERPWD, gist_auth);
-	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
-	curl_easy_setopt(curl, CURLOPT_POST, 1);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
-	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &curl_header_cb);
-
-	CURLcode ret = curl_easy_perform(curl);
-
-	sb_push(data, 0);
-
-	if(ret != 0){
-		printf("CURL returned %d, %s\n", ret, curl_easy_strerror(ret));
-		if(data){
-			printf("RESPONSE: [%s]\n", data);
-		}
-	} else {
-		puts("mod_quotes: gist updated successfully");
-		quotes_dirty = false;
-	}
-
-	sb_free(data);
-
-	curl_slist_free_all(slist);
-
-	yajl_gen_free(json);
-
-	return true;
+	inso_gist_unlock(gist);
 }
 
 static void quotes_ipc(int sender, const uint8_t* data, size_t data_len){
 	if(!memchr(data, 0, data_len)) return;
 
 	int id;
-	char *name = NULL, *chan = NULL;
+	char* chan = NULL;
+	int name_offset = 0;
 
-	if(sscanf(data, "ADD %d %ms %ms", &id, &name, &chan) == 3){
+	if(sscanf(data, "ADD %d %ms %n", &id, &chan, &name_offset) == 2){
 		quotes_reload();
-		quotes_notify(chan, name, quote_get(chan, id));
+		quotes_notify(chan, data + name_offset, quote_get(chan, id));
 	}
 
-	free(name);
 	free(chan);
 }

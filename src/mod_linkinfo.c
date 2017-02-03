@@ -5,8 +5,11 @@
 #include <yajl/yajl_tree.h>
 #include <string.h>
 #include <assert.h>
+#include <wchar.h>
 #include "stb_sb.h"
-#include "utils.h"
+#include "inso_utils.h"
+
+//#define USE_LEGIT_YOUTUBE_API
 
 static void linkinfo_msg  (const char*, const char*, const char*);
 static bool linkinfo_init (const IRCCoreCtx*);
@@ -26,9 +29,14 @@ static const IRCCoreCtx* ctx;
 static regex_t yt_url_regex;
 static regex_t yt_title_regex;
 static regex_t yt_length_regex;
+static regex_t yt_playlist_regex;
+static const char* yt_api_key;
 
 static regex_t msdn_url_regex;
+static regex_t hmn_url_regex;
+static regex_t hmn_og_regex;
 static regex_t generic_title_regex;
+static regex_t ograph_desc_regex;
 
 static regex_t twitter_url_regex;
 static const char* twitter_token;
@@ -44,7 +52,7 @@ static bool linkinfo_init(const IRCCoreCtx* _ctx){
 
 	ret = ret & (regcomp(
 		&yt_url_regex,
-		"(y2u\\.be\\/|youtu\\.be\\/|youtube(-nocookie)?\\.com/(embed\\/|v\\/|watch\\?v=))([0-9A-Za-z_\\-]+)",
+		"(y2u\\.be\\/|youtu\\.be\\/|youtube(-nocookie)?\\.com/(embed\\/|v\\/|watch\\?v=))([0-9A-Za-z_\\-]{11})",
 		REG_EXTENDED | REG_ICASE
 	) == 0);
 
@@ -61,14 +69,39 @@ static bool linkinfo_init(const IRCCoreCtx* _ctx){
 	) == 0);
 
 	ret = ret & (regcomp(
+		&yt_playlist_regex,
+		"youtube.com/playlist\\?list=([0-9A-Za-z_\\-]+)",
+		REG_EXTENDED | REG_ICASE
+	) == 0);
+
+	ret = ret & (regcomp(
 		&msdn_url_regex,
 		"msdn\\.microsoft\\.com/[^/]+/library/.*\\.aspx",
 		REG_EXTENDED | REG_ICASE
 	) == 0);
 
 	ret = ret & (regcomp(
+		&hmn_url_regex,
+		"([^/]+\\.)?handmade\\.network/(forums(/[^/]+)?/t|blogs?/p)/[0-9]+",
+		REG_EXTENDED | REG_ICASE
+	) == 0);
+
+	ret = ret & (regcomp(
+		&hmn_og_regex,
+		"([^/]+\\.)?handmade\\.network/[^$[:space:]]*",
+		REG_EXTENDED | REG_ICASE
+	) == 0);
+
+	ret = ret & (regcomp(
 		&generic_title_regex,
 		"<title>([^<]+)</title>",
+		REG_EXTENDED | REG_ICASE
+	) == 0);
+
+	// TODO: Avoid summoning Zalgo
+	ret = ret & (regcomp(
+		&ograph_desc_regex,
+		"<meta property=\"og:description\" content=\"([^\"]+)\"",
 		REG_EXTENDED | REG_ICASE
 	) == 0);
 
@@ -92,13 +125,18 @@ static bool linkinfo_init(const IRCCoreCtx* _ctx){
 
 	ret = ret & (regcomp(
 		&xkcd_url_regex,
-		"https?://xkcd.com/([0-9]+)",
+		"https?://(www.)?xkcd.com/([0-9]+)",
 		REG_EXTENDED | REG_ICASE
 	) == 0);
 
 	twitter_token = getenv("INSOBOT_TWITTER_TOKEN");
 	if(!twitter_token || !*twitter_token){
 		fputs("mod_linkinfo: no twitter token, expanding tweets won't work.\n", stderr);
+	}
+
+	yt_api_key = getenv("INSOBOT_YT_API_KEY");
+	if(!yt_api_key || !*yt_api_key){
+		fputs("mod_linkinfo: no youtube api key, no expanding of playlists.\n", stderr);
 	}
 
 	return ret;
@@ -108,14 +146,122 @@ static void linkinfo_quit(void){
 	regfree(&yt_url_regex);
 	regfree(&yt_title_regex);
 	regfree(&yt_length_regex);
+	regfree(&yt_playlist_regex);
 	regfree(&msdn_url_regex);
+	regfree(&hmn_url_regex);
+	regfree(&hmn_og_regex);
 	regfree(&generic_title_regex);
+	regfree(&ograph_desc_regex);
 	regfree(&twitter_url_regex);
 	regfree(&steam_url_regex);
 	regfree(&vimeo_url_regex);
 	regfree(&xkcd_url_regex);
 }
 
+typedef struct {
+	char *from, *to;
+	size_t from_len, to_len;
+} Replacement;
+
+static void html_unescape(char* msg, size_t len){
+
+	#define RTAG(x, y) { .from = (x), .to = (y), .from_len = sizeof(x) - 1, .to_len = sizeof(y) - 1 }
+	Replacement tags[] = {
+		RTAG("&amp;", "&"),
+		RTAG("&gt;", ">"),
+		RTAG("&lt;", "<"),
+		RTAG("&quot;", "\""),
+		RTAG("&nbsp;", " "),
+
+		// not really html tags, but useful replacements
+		RTAG("\n", " "),
+		RTAG("\r", " "),
+	};
+	#undef RTAG
+
+	char c[MB_LEN_MAX];
+
+	for(char* p = msg; *p; ++p){
+		for(int i = 0; i < sizeof(tags) / sizeof(*tags); ++i){
+			if(strncmp(p, tags[i].from, tags[i].from_len) == 0){
+				const int sz = tags[i].from_len - tags[i].to_len;
+				assert(sz >= 0);
+
+				memmove(p, p + sz, len - (p - msg));
+				memcpy(p, tags[i].to, tags[i].to_len);
+				break;
+			}
+		}
+
+		wchar_t wc;
+		int old_len, new_len;
+		if(sscanf(p, "&#%u;%n", &wc, &old_len) == 1){
+			if((new_len = wctomb(c, wc)) > 0 && old_len > new_len){
+				memmove(p, p + (old_len - new_len), len - (p - msg));
+				memcpy(p, c, new_len);
+			}
+		}
+	}
+}
+
+#ifdef USE_LEGIT_YOUTUBE_API
+static void do_youtube_info(const char* chan, const char* msg, regmatch_t* matches){
+	regmatch_t* match = matches + 4;
+
+	if(!yt_api_key) return;
+	if(match->rm_so == -1 || match->rm_eo == -1) return;
+
+	char* url;
+	asprintf_check(
+		&url,
+		"https://www.googleapis.com/youtube/v3/videos?id=%.*s&part=contentDetails,snippet&key=%s"
+		"&fields=items(snippet(title,liveBroadcastContent),contentDetails(duration))",
+		match->rm_eo - match->rm_so,
+		msg + match->rm_so,
+		yt_api_key
+	);
+
+	char* data = NULL;
+	CURL* curl = inso_curl_init(url, &data);
+	free(url);
+
+	if(curl_easy_perform(curl) == 0){
+		sb_push(data, 0);
+
+		static const char* items_path[]    = { "items", NULL };
+		static const char* title_path[]    = { "snippet", "title", NULL };
+		static const char* duration_path[] = { "contentDetails", "duration", NULL };
+		static const char* islive_path[]   = { "snippet", "liveBroadcastContent", NULL };
+
+		yajl_val root  = yajl_tree_parse(data, NULL, 0);
+		yajl_val items = yajl_tree_get(root, items_path, yajl_t_array);
+		yajl_val title = NULL, duration = NULL, islive = NULL;
+
+		if(root && items && items->u.array.len > 0){
+			title    = yajl_tree_get(items->u.array.values[0], title_path   , yajl_t_string);
+			duration = yajl_tree_get(items->u.array.values[0], duration_path, yajl_t_string);
+			islive   = yajl_tree_get(items->u.array.values[0], islive_path  , yajl_t_string);
+		}
+
+		if(title && islive && strcmp(islive->u.string, "live") == 0){
+			ctx->send_msg(chan, "↑ YT Video: [%s] [LIVE]", title->u.string);
+		} else if(title && duration){
+			int h = 0, m = 0, s = 0;
+			if(sscanf(duration->u.string, "PT%dH%dM%dS", &h, &m, &s) == 3){
+				ctx->send_msg(chan, "↑ YT Video: [%s] [%d:%02d:%02d]", title->u.string, h, m, s);
+			} else if(sscanf(duration->u.string, "PT%dM%dS", &m, &s) == 2){
+				ctx->send_msg(chan, "↑ YT Video: [%s] [%02d:%02d]", title->u.string, m, s);
+			} else if(sscanf(duration->u.string, "PT%dS", &s) == 1){
+				ctx->send_msg(chan, "↑ YT Video: [%s] [00:%02d]", title->u.string, s);
+			}
+		}
+		yajl_tree_free(root);
+	}
+
+	curl_easy_cleanup(curl);
+	sb_free(data);
+}
+#else
 static void do_youtube_info(const char* chan, const char* msg, regmatch_t* matches){
 	regmatch_t* match = matches + 4;
 
@@ -197,79 +343,100 @@ static void do_youtube_info(const char* chan, const char* msg, regmatch_t* match
 
 	sb_free(data);
 }
+#endif
 
-void do_generic_info(const char* chan, const char* msg, regmatch_t* matches, const char* tag){
+void do_yt_playlist_info(const char* chan, const char* msg, regmatch_t* matches){
+	regmatch_t* id = matches + 1;
+	char url[1024];
 
-	const char url_prefix[] = "https://";
-	int prefix_sz = sizeof(url_prefix) - 1;
-	int match_sz  = matches[0].rm_eo - matches[0].rm_so;
+	if(!yt_api_key) return;
+	if(id->rm_so == -1 || id->rm_eo == -1) return;
 
-	char* url = alloca(match_sz + sizeof(url_prefix));
-	memcpy(url, url_prefix, prefix_sz);
-	memcpy(url + prefix_sz, msg + matches[0].rm_so, match_sz);
-	url[prefix_sz + match_sz] = 0;
+	puts("mod_linkinfo: getting yt playlist info.");
+	snprintf(
+		url,
+		sizeof(url),
+		"https://www.googleapis.com/youtube/v3/playlists?part=snippet&id=%.*s&key=%s",
+		id->rm_eo - id->rm_so,
+		msg + id->rm_so,
+		yt_api_key
+	);
+
+	static const char* items_path[] = { "items", NULL };
+	static const char* title_path[] = { "snippet", "title", NULL };
+	static const char* chant_path[] = { "snippet", "channelTitle", NULL };
 
 	char* data = NULL;
-
-	fprintf(stderr, "linkinfo: Fetching [%s]\n", url);
-
-
-	/* if you get curl SSL Connect errors here for some reason, it seems like a bug in 
-	 * the gnutls version of curl, using the openssl version fixed it for me
-	 */
-
 	CURL* curl = inso_curl_init(url, &data);
-	CURLcode curl_ret = curl_easy_perform(curl);
+	if(curl_easy_perform(curl) == 0){
+		sb_push(data, 0);
 
-	sb_push(data, 0);
+		yajl_val root  = yajl_tree_parse(data, NULL, 0);
+		yajl_val items = yajl_tree_get(root, items_path, yajl_t_array);
 
-	regmatch_t title[2];
-	int title_len = 0;
+		if(items && items->u.array.len > 0){
+			yajl_val obj = items->u.array.values[0];
+			yajl_val title = yajl_tree_get(obj, title_path, yajl_t_string);
+			yajl_val chant = yajl_tree_get(obj, chant_path, yajl_t_string);
 
-	if(
-		curl_ret == 0 &&
-		regexec(&generic_title_regex, data, 2, title, 0) == 0 &&
-		(title_len = (title[1].rm_eo - title[1].rm_so)) > 0
-	){
-		ctx->send_msg(chan, "↑ %s: [%.*s]", tag, title_len, data + title[1].rm_so);
-	} else {
-		fprintf(stderr, "linkinfo: Couldn't extract title\n[%s]\n[%s]", curl_easy_strerror(curl_ret), data);
-		ctx->send_msg(chan, "Error getting %s data. Blame insofaras.", tag);
+			if(title && chant){
+				ctx->send_msg(chan, "↑ YT Playlist: [%s] by %s.", title->u.string, chant->u.string);
+			}
+		}
+		yajl_tree_free(root);
 	}
-
 	curl_easy_cleanup(curl);
-
 	sb_free(data);
 }
 
-typedef struct {
-	char *from, *to;
-	size_t from_len, to_len;
-} Replacement;
+char* do_download(const char* url){
+	char* data = NULL;
+	CURL* curl = inso_curl_init(url, &data);
+	CURLcode curl_ret = curl_easy_perform(curl);
+	sb_push(data, 0);
+	curl_easy_cleanup(curl);
 
-//XXX: this isn't very good. it only replaces a couple of escape sequences that turn up in the twitter api for whatever reason.
-static void dodgy_html_unescape(char* msg, size_t len){
+	if(curl_ret == CURLE_OK){
+		return data;
+	} else {
+		sb_free(data);
+		return NULL;
+	}
+}
 
-	#define RTAG(x, y) { .from = (x), .to = (y), .from_len = sizeof(x) - 1, .to_len = sizeof(y) - 1 }
-	Replacement tags[] = {
-		RTAG("&amp;", "&"),
-		RTAG("&gt;", ">"),
-		RTAG("&lt;", "<")
-	};
-	#undef RTAG
+void do_generic_info(const char* chan, const char* url, const char* tag){
+	char* html;
+	regmatch_t title[2];
+	int title_len = 0;
 
-	for(char* p = msg; *p; ++p){
-		for(int i = 0; i < sizeof(tags) / sizeof(*tags); ++i){
-			if(strncmp(p, tags[i].from, tags[i].from_len) == 0){
-				const int sz = tags[i].from_len - tags[i].to_len;
-				assert(sz >= 0);
+	fprintf(stderr, "linkinfo: Fetching title [%s]\n", url);
 
-				memmove(p, p + sz, len - (p - msg));
-				memcpy(p, tags[i].to, tags[i].to_len);
-			}
-		}
+	if((html = do_download(url)) &&
+		regexec(&generic_title_regex, html, 2, title, 0) == 0 &&
+		(title_len = (title[1].rm_eo - title[1].rm_so)) > 0
+	){
+		char* title_str = strndupa(html + title[1].rm_so, title_len);
+		html_unescape(title_str, title_len);
+		ctx->send_msg(chan, "↑ %s: [%s]", tag, title_str);
 	}
 
+	sb_free(html);
+}
+
+void do_ograph_info(const char* chan, const char* url, const char* tag){
+	char* html;
+	regmatch_t desc[2];
+
+	fprintf(stderr, "linkinfo: Fetching og desc [%s]\n", url);
+
+	if((html = do_download(url)) && regexec(&ograph_desc_regex, html, 2, desc, 0) == 0){
+		int len = desc[1].rm_eo - desc[1].rm_so;
+		char* desc_str = strndupa(html + desc[1].rm_so, len);
+		html_unescape(desc_str, len);
+		ctx->send_msg(chan, "↑ %s: [%s]", tag, desc_str);
+	}
+
+	sb_free(html);
 }
 
 static const char* url_path[]        = { "url", NULL };
@@ -442,9 +609,7 @@ static void do_twitter_info(const char* chan, const char* msg, regmatch_t* match
 	strcpy(write_ptr, read_ptr);
 
 	for(unsigned char* c = fixed_text; *c; ++c) if(*c < ' ') *c = ' ';
-
-	dodgy_html_unescape(fixed_text, strlen(fixed_text));
-
+	html_unescape(fixed_text, strlen(fixed_text));
 	sb_free(url_replacements);
 
 	ctx->send_msg(chan, "↑ Tweet by %s: [%s] [%s]", user->u.string, fixed_text, time_buf);
@@ -596,7 +761,7 @@ out:
 
 static void do_xkcd_info(const char* chan, const char* msg, regmatch_t* matches){
 
-	const char* id = strndupa(msg + matches[1].rm_so, matches[1].rm_eo - matches[1].rm_so);
+	const char* id = strndupa(msg + matches[2].rm_so, matches[2].rm_eo - matches[2].rm_so);
 	char* data = NULL;
 	char* url;
 	asprintf_check(&url, "https://xkcd.com/%s/info.0.json", id);
@@ -636,13 +801,30 @@ static void do_xkcd_info(const char* chan, const char* msg, regmatch_t* matches)
 static void linkinfo_msg(const char* chan, const char* name, const char* msg){
 
 	regmatch_t matches[5] = {};
+	regmatch_t* m = matches;
+	char url[512];
 
 	if(regexec(&yt_url_regex, msg, 5, matches, 0) == 0){
 		do_youtube_info(chan, msg, matches);
 	}
 
+	if(regexec(&yt_playlist_regex, msg, 2, matches, 0) == 0){
+		do_yt_playlist_info(chan, msg, matches);
+	}
+
+	if(regexec(&hmn_url_regex, msg, 1, matches, 0) == 0){
+		if(msg[m->rm_eo] != '-'){
+			snprintf(url, sizeof(url), "https://%.*s", m->rm_eo - m->rm_so, msg + m->rm_so);
+			do_generic_info(chan, url, "HMN");
+		}
+	} else if(regexec(&hmn_og_regex, msg, 1, matches, 0) == 0){
+		snprintf(url, sizeof(url), "https://%.*s", m->rm_eo - m->rm_so, msg + m->rm_so);
+		do_ograph_info(chan, url, "HMN");
+	}
+
 	if(regexec(&msdn_url_regex, msg, 1, matches, 0) == 0){
-		do_generic_info(chan, msg, matches, "MSDN");
+		snprintf(url, sizeof(url), "https://%.*s", m->rm_eo - m->rm_so, msg + m->rm_so);
+		do_generic_info(chan, url, "MSDN");
 	}
 
 	if(regexec(&twitter_url_regex, msg, 2, matches, 0) == 0){
@@ -657,7 +839,7 @@ static void linkinfo_msg(const char* chan, const char* name, const char* msg){
 		do_vimeo_info(chan, msg, matches);
 	}
 
-	if(regexec(&xkcd_url_regex, msg, 2, matches, 0) == 0){
+	if(regexec(&xkcd_url_regex, msg, 3, matches, 0) == 0){
 		do_xkcd_info(chan, msg, matches);
 	}
 

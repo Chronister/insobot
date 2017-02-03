@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <time.h>
 #include "config.h"
 
 typedef struct IRCCoreCtx_ IRCCoreCtx;
@@ -14,9 +15,9 @@ typedef struct IRCModuleCtx_ {
 	const char*        name;
 	const char*        desc;
 	const char**       commands; // null-terminated, use DEFINE_CMDS macro
-	unsigned int       priority; // bigger number = higher priority
-	unsigned int       flags;
-	
+	intptr_t           priority; // bigger number = higher priority
+	uintptr_t          flags;
+
 	bool (*on_init)    (const IRCCoreCtx* ctx);
 	void (*on_quit)    (void);
 
@@ -45,7 +46,7 @@ typedef struct IRCModuleCtx_ {
 	void (*on_mod_msg) (const char* sender, const IRCModMsg* msg);
 
 	// called atleast once every ~250ms
-	void (*on_tick)    (void);
+	void (*on_tick)    (time_t now);
 
 	// called if something was written to stdin
 	void (*on_stdin)   (const char* text);
@@ -57,13 +58,20 @@ typedef struct IRCModuleCtx_ {
 	void (*on_ipc)     (int sender_id, const uint8_t* data, size_t data_len);
 } IRCModuleCtx;
 
+// incremented when new functions are added to IRCCoreCtx
+#define INSO_CORE_API_VERSION 1
+
 // passed to modules to provide functions for them to use.
 struct IRCCoreCtx_ {
 
+	const uintptr_t api_version;
+
+	intptr_t       (*get_info)     (int id); // see IRC_INFO enum below
 	const char*    (*get_username) (void);
 	const char*    (*get_datafile) (void);
 	IRCModuleCtx** (*get_modules)  (bool channel_mods_only); // null terminated
 	const char**   (*get_channels) (void); // null terminated
+	const char**   (*get_nicks)    (const char* chan, int* count_out);
 	void           (*join)         (const char* chan);
 	void           (*part)         (const char* chan);
 	void           (*send_msg)     (const char* chan, const char* fmt, ...) __attribute__ ((format (printf, 2, 3)));
@@ -72,6 +80,13 @@ struct IRCCoreCtx_ {
 	void           (*send_mod_msg) (IRCModMsg* msg);
 	void           (*save_me)      (void);
 	void           (*log)          (const char* fmt, ...) __attribute__ ((format (printf, 1, 2)));
+	void           (*strip_colors) (char* msg);
+	bool           (*responded)    (void); // true if send_msg was called for the current msg already
+	bool           (*get_tag)      (size_t index, const char** k, const char** v); // IRCv3 tag iteration (if available)
+};
+
+enum {
+	IRC_INFO_CAN_PARSE_TAGS, // bool
 };
 
 // used for on_meta callback, which determines if the callback will be called or not.

@@ -10,7 +10,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include "config.h"
-#include "utils.h"
+#include "inso_utils.h"
 
 static void meta_cmd   (const char*, const char*, const char*, int);
 static bool meta_save  (FILE*);
@@ -24,7 +24,7 @@ enum { CMD_MODULES, CMD_MOD_ON, CMD_MOD_OFF, CMD_MOD_INFO };
 const IRCModuleCtx irc_mod_ctx = {
 	.name     = "meta",
 	.desc     = "Manages channel permissons of other modules",
-	.priority = UINT_MAX,
+	.priority = 10000,
 	.flags    = IRC_MOD_GLOBAL,
 	.on_cmd   = &meta_cmd,
 	.on_save  = &meta_save,

@@ -4,16 +4,16 @@
 #include <time.h>
 #include <string.h>
 #include <yajl/yajl_tree.h>
-#include "utils.h"
+#include "inso_utils.h"
 
 static bool twitch_init    (const IRCCoreCtx*);
 static void twitch_cmd     (const char*, const char*, const char*, int);
-static void twitch_tick    (void);
+static void twitch_tick    (time_t);
 static bool twitch_save    (FILE*);
 static void twitch_quit    (void);
 static void twitch_mod_msg (const char* sender, const IRCModMsg* msg);
 
-enum { FOLLOW_NOTIFY, UPTIME, TWITCH_VOD, TWITCH_TRACKER, TWITCH_TITLE };
+enum { FOLLOW_NOTIFY, UPTIME, TWITCH_VOD1, TWITCH_VOD2, TWITCH_TRACKER, TWITCH_TITLE };
 
 const IRCModuleCtx irc_mod_ctx = {
 	.name     = "twitch",
@@ -25,11 +25,12 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_quit  = &twitch_quit,
 	.on_mod_msg = &twitch_mod_msg,
 	.commands = DEFINE_CMDS (
-		[FOLLOW_NOTIFY]  = CONTROL_CHAR "fnotify",
-		[UPTIME]         = CONTROL_CHAR "uptime "  CONTROL_CHAR_2 "uptime",
-		[TWITCH_VOD]     = CONTROL_CHAR "vod "     CONTROL_CHAR_2 "vod",
-		[TWITCH_TRACKER] = CONTROL_CHAR "tracker " CONTROL_CHAR_2 "tracker " CONTROL_CHAR "streams " CONTROL_CHAR_2 "streams",
-		[TWITCH_TITLE]   = CONTROL_CHAR "title "   CONTROL_CHAR_2 "title"
+		[FOLLOW_NOTIFY]  = CMD("fnotify"),
+		[UPTIME]         = CMD("uptime" ),
+		[TWITCH_VOD1]    = CMD1("vod"   ),
+		[TWITCH_VOD2]    = CMD2("vod"   ),
+		[TWITCH_TRACKER] = CMD("tracker") CMD("streams"),
+		[TWITCH_TITLE]   = CMD("title"  )
 	)
 };
 
@@ -303,7 +304,23 @@ static bool twitch_check_live(size_t index){
 	return t->stream_start != 0;
 }
 
-static void twitch_print_vod(size_t index, const char* send_chan, const char* name){
+static const char* twitch_display_name(const char* fallback){
+	int i = 0;
+	const char *k, *v;
+	while(ctx->get_tag(i++, &k, &v)){
+		if(strcmp(k, "display-name") == 0){
+			if(*v) return v;
+			else return fallback;
+		}
+	}
+	return fallback;
+}
+
+static void check_alias_cb(intptr_t result, intptr_t arg){
+	*(int*)arg = result;
+}
+
+static void twitch_print_vod(size_t index, const char* send_chan, const char* name, int cmd){
 
 	char* chan    = twitch_keys[index];
 	TwitchInfo* t = twitch_vals + index;
@@ -325,9 +342,9 @@ static void twitch_print_vod(size_t index, const char* send_chan, const char* na
 		goto out;
 	}
 
-	const char* videos_path[]      = { "videos", NULL };
-	const char* vod_url_path[]     = { "url", NULL };
-	const char* vod_title_path[]   = { "title", NULL };
+	const char* videos_path[]    = { "videos", NULL };
+	const char* vod_url_path[]   = { "url", NULL };
+	const char* vod_title_path[] = { "title", NULL };
 
 	yajl_val videos = yajl_tree_get(root, videos_path, yajl_t_array);
 	if(!videos || !YAJL_IS_ARRAY(videos)){
@@ -335,8 +352,19 @@ static void twitch_print_vod(size_t index, const char* send_chan, const char* na
 		goto out;
 	}
 
-	if(videos->u.array.len < 1){
-		fprintf(stderr, "twitch_print_vod: videos empty");
+	if(videos->u.array.len == 0){
+		int alias_exists = 0;
+
+		if((cmd == TWITCH_VOD1 && strcmp(CONTROL_CHAR  , "!") == 0) ||
+		   (cmd == TWITCH_VOD2 && strcmp(CONTROL_CHAR_2, "!") == 0)) {
+			const char* args[] = { "vod", send_chan };
+			MOD_MSG(ctx, "alias_exists", args, &check_alias_cb, &alias_exists);
+		}
+
+		if(!alias_exists){
+			ctx->send_msg(send_chan, "%s: No recent VoD found for %s.", name, chan + 1);
+		}
+
 		goto out;
 	}
 
@@ -355,9 +383,10 @@ static void twitch_print_vod(size_t index, const char* send_chan, const char* na
 	}
 
 	const char* title = vod_title->u.string ?: "untitled";
+	const char* dispname = twitch_display_name(name);
 
 	asprintf_check(&t->last_vod_msg, "%s's last VoD: %s [%s]", chan + 1, vod_url->u.string, title);
-	ctx->send_msg(send_chan, "%s: %s", name, t->last_vod_msg);
+	ctx->send_msg(send_chan, "%s: %s", dispname, t->last_vod_msg);
 
 out:
 	if(data) sb_free(data);
@@ -366,6 +395,31 @@ out:
 
 #define TWITCH_TRACKER_MSG(fmt, ...) \
 	for(char** c = twitch_tracker_chans; c < sb_end(twitch_tracker_chans); ++c) ctx->send_msg(*c, fmt, __VA_ARGS__)
+
+static void twitch_print_tags(const char* prefix){
+	char tag_buf[1024];
+
+	for(char** chan = twitch_tracker_chans; chan < sb_end(twitch_tracker_chans); ++chan){
+		*tag_buf = 0;
+
+		int count;
+		const char** nicks = ctx->get_nicks(*chan, &count);
+
+		for(char** tag = twitch_tracker_tags; tag < sb_end(twitch_tracker_tags); ++tag){
+			for(int i = 0; i < count; ++i){
+				if(strcasecmp(*tag, nicks[i]) == 0){
+					inso_strcat(tag_buf, sizeof(tag_buf), *tag);
+					inso_strcat(tag_buf, sizeof(tag_buf), " ");
+					break;
+				}
+			}
+		}
+
+		if(*tag_buf){
+			ctx->send_msg(*chan, "%s%s", prefix, tag_buf);
+		}
+	}
+}
 
 static void twitch_tracker_update(void){
 
@@ -388,12 +442,6 @@ static void twitch_tracker_update(void){
 	twitch_check_uptime(index_count, track_indices);
 	sb_free(track_indices);
 
-	char tag_buf[1024] = {};
-	for(char** c = twitch_tracker_tags; c < sb_end(twitch_tracker_tags); ++c){
-		inso_strcat(tag_buf, sizeof(tag_buf), *c);
-		inso_strcat(tag_buf, sizeof(tag_buf), " ");
-	}
-
 	for(int i = 0; i < sb_count(twitch_keys); ++i){
 		if(!twitch_vals[i].is_tracked) continue;
 
@@ -408,8 +456,8 @@ static void twitch_tracker_update(void){
 			inso_strcat(topic, sizeof(topic), " ");
 
 			if(changed){
-				if(!sent_ping && *tag_buf){
-					TWITCH_TRACKER_MSG("FAO %s:", tag_buf);
+				if(!sent_ping){
+					twitch_print_tags("FAO: ");
 					sent_ping = true;
 				}
 				any_changed = true;
@@ -495,10 +543,12 @@ static void twitch_tracker_cmd(const char* chan, const char* name, const char* a
 
 	} else {
 
+		const char* dispname = twitch_display_name(name);
+
 		int tag_index = -1;
 		for(char** tag = twitch_tracker_tags; tag < sb_end(twitch_tracker_tags); ++tag){
 			if(strcasecmp(*tag, name) == 0){
-				tag_index = tag - twitch_tracker_chans;
+				tag_index = tag - twitch_tracker_tags;
 				break;
 			}
 		}
@@ -507,21 +557,22 @@ static void twitch_tracker_cmd(const char* chan, const char* name, const char* a
 
 			if(tag_index == -1){
 				sb_push(twitch_tracker_tags, strdup(name));
-				ctx->send_msg(chan, "%s: You'll now be tagged when streams go live!", name);
+				ctx->send_msg(chan, "%s: You'll now be tagged when streams go live!", dispname);
 				ctx->save_me();
 			} else {
-				ctx->send_msg(chan, "%s: You're already tagged, my friend.", name);
+				ctx->send_msg(chan, "%s: You're already tagged, my friend.", dispname);
 			}
 
 		} else if(strcasecmp(arg, " untagme") == 0){
 
 			if(tag_index != -1){
 				sb_erase(twitch_tracker_tags, tag_index);
-				ctx->send_msg(chan, "%s: OK, I've untagged you.", name);
+				ctx->send_msg(chan, "%s: OK, I've untagged you.", dispname);
 				ctx->save_me();
 			} else {
-				ctx->send_msg(chan, "%s: You're already not tagged.", name);
+				ctx->send_msg(chan, "%s: You're already not tagged.", dispname);
 			}
+
 		} else if(strcasecmp(arg, " list") == 0){
 
 			int max_display_len = 0;
@@ -573,7 +624,7 @@ static void twitch_tracker_cmd(const char* chan, const char* name, const char* a
 			ctx->send_msg(chan, "Tracked channels: %s", chan_buf);
 
 		} else {
-			ctx->send_msg(chan, "%s: Usage: !streams [list|tagme|untagme|chans|add <chan> [name]|del <chan>]", name);
+			ctx->send_msg(chan, "%s: Usage: !streams [list|tagme|untagme|chans|add <chan> [name]|del <chan>]", dispname);
 		}
 	}
 }
@@ -604,21 +655,25 @@ static void twitch_set_title(const char* chan, const char* name, const char* msg
 	long http_code = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
+	const char* dispname = twitch_display_name(name);
+
 //	fprintf(stderr, "response: [%s]\n", response);
 	sb_free(response);
 
 	if(http_code == 200){
-		ctx->send_msg(chan, "%s: Title updated successfully.", name);
+		ctx->send_msg(chan, "%s: Title updated successfully.", dispname);
 	} else if(http_code == 403){
-		ctx->send_msg(chan, "%s: I don't have permission to update the title.", name);
+		ctx->send_msg(chan, "%s: I don't have permission to update the title.", dispname);
 	} else {
-		ctx->send_msg(chan, "%s: Error updating title for channel \"%s\".", name, chan+1);
+		ctx->send_msg(chan, "%s: Error updating title for channel \"%s\".", dispname, chan+1);
 	}
 }
 
 static void twitch_cmd(const char* chan, const char* name, const char* arg, int cmd){
 	bool is_admin = strcasecmp(chan + 1, name) == 0 || inso_is_admin(ctx, name);
 	bool is_wlist = is_admin || inso_is_wlist(ctx, name);
+
+	const char* dispname = twitch_display_name(name);
 
 	switch(cmd){
 		case FOLLOW_NOTIFY: {
@@ -629,16 +684,16 @@ static void twitch_cmd(const char* chan, const char* name, const char* arg, int 
 
 			if(strcasecmp(arg, "off") == 0){
 				if(t->do_follower_notify){
-					ctx->send_msg(chan, "%s: Disabled follow notifier.", name);
+					ctx->send_msg(chan, "%s: Disabled follow notifier.", dispname);
 					t->do_follower_notify = false;
 				} else {
-					ctx->send_msg(chan, "%s: It's already disabled.", name);
+					ctx->send_msg(chan, "%s: It's already disabled.", dispname);
 				}
 			} else if(strcasecmp(arg, "on") == 0){
 				if(t->do_follower_notify){
-					ctx->send_msg(chan, "%s: It's already enabled.", name);
+					ctx->send_msg(chan, "%s: It's already enabled.", dispname);
 				} else {
-					ctx->send_msg(chan, "%s: Enabled follow notifier.", name);
+					ctx->send_msg(chan, "%s: Enabled follow notifier.", dispname);
 					t->do_follower_notify = true;
 				}
 			}
@@ -662,13 +717,14 @@ static void twitch_cmd(const char* chan, const char* name, const char* arg, int 
 				}
 				snprintf_chain(&time_ptr, &time_sz, "%d minute%s.", minutes, minutes == 1 ? "" : "s");
 
-				ctx->send_msg(chan, "%s: The stream has been live for %s", name, time_buf);
+				ctx->send_msg(chan, "%s: The stream has been live for %s", dispname, time_buf);
 			} else {
-				ctx->send_msg(chan, "%s: The stream is not live.", name);
+				ctx->send_msg(chan, "%s: The stream is not live.", dispname);
 			}
 		} break;
 
-		case TWITCH_VOD: {
+		case TWITCH_VOD1:
+		case TWITCH_VOD2: {
 			TwitchInfo* t;
 
 			if(*arg++){
@@ -685,7 +741,7 @@ static void twitch_cmd(const char* chan, const char* name, const char* arg, int 
 				t = twitch_get_or_add(chan);
 			}
 
-			twitch_print_vod(t - twitch_vals, chan, name);
+			twitch_print_vod(t - twitch_vals, chan, name, cmd);
 		} break;
 
 		case TWITCH_TRACKER: {
@@ -798,8 +854,7 @@ out:
 	if(root) yajl_tree_free(root);
 }
 
-static void twitch_tick(void){
-	time_t now = time(0);
+static void twitch_tick(time_t now){
 
 	if(now - last_tracker_update > tracker_update_interval){
 		puts("mod_twitch: tracker update...");
@@ -900,5 +955,26 @@ static void twitch_mod_msg(const char* sender, const IRCModMsg* msg){
 		if(u){
 			msg->callback(u->created_at, msg->cb_arg);
 		}
+	} else if(strcmp(msg->cmd, "twitch_is_live") == 0){
+		const char* prev_p = (const char*)msg->arg;
+		const char* p;
+		bool live = false;
+
+		do {
+			p = strchrnul(prev_p, ' ');
+			char* chan = strndupa(prev_p, p - prev_p);
+			prev_p = p+1;
+
+			TwitchInfo* t = twitch_get_or_add(chan);
+			if(twitch_check_live(t - twitch_vals)){
+				live = true;
+				break;
+			}
+		} while(*p);
+
+		msg->callback(live, msg->cb_arg);
+	} else if(strcmp(msg->cmd, "display_name") == 0){
+		const char* dispname = twitch_display_name((const char*)msg->arg);
+		msg->callback((intptr_t)dispname, msg->cb_arg);
 	}
 }

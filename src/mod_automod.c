@@ -3,8 +3,11 @@
 #include <string.h>
 #include <wchar.h>
 #include <ctype.h>
+#include <time.h>
 #include "stb_sb.h"
-#include "utils.h"
+#include "inso_utils.h"
+
+//#define TRIGGER_HAPPY
 
 static void automod_msg     (const char*, const char*, const char*);
 static void automod_cmd     (const char*, const char*, const char*, int);
@@ -54,7 +57,7 @@ static bool automod_init(const IRCCoreCtx* _ctx){
 	is_twitch = true;
 	return regcomp(
 		&url_regex,
-		"(https?://[^[:space:]]+|[^[:space:]]\\.[^[:space:]]{2,6}([:space:]|$|/))",
+        "\\b(https?://[^[:space:]]+|[a-zA-Z0-9][a-zA-Z0-9\\-_]*\\.[A-Za-z]{2,5}(\\.[A-Za-z]{2,5})*([:space:]|$|/|#|:|\\?))",
 		REG_ICASE | REG_EXTENDED | REG_NEWLINE
 	) == 0;
 }
@@ -125,8 +128,11 @@ static void automod_join(const char* chan, const char* name){
 	}
 }
 
+#ifdef TRIGGER_HAPPY
 static int am_score_caps(const Suspect* s, const char* msg, size_t len){
 	size_t num_caps = 0;
+
+	if(len < 10) return 0;
 
 	for(const char* p = msg; *p; ++p){
 		if(isupper(*p)) num_caps++;
@@ -134,6 +140,7 @@ static int am_score_caps(const Suspect* s, const char* msg, size_t len){
 
 	return (num_caps / (float)len) > 0.80 ? 45 : 0;
 }
+#endif
 
 #ifndef __STDC_ISO_10646__
 	#error "Your OS/compiler doesn't store a Unicode / UCS4 codepoint in a wchar_t :("
@@ -159,17 +166,52 @@ static int am_score_ascii_art(const Suspect* s, const char* msg, size_t len){
 
 		// box drawing glyphs
 		if(codepoint >= 0x2500 && codepoint < 0x2600){
-			bad_char_score += 10;
+			bad_char_score += 1;
 		}
 
 		// hexagrams
 		if(codepoint >= 0x4DC0 && codepoint < 0x4E00){
-			bad_char_score += 5;
+			bad_char_score += 1;
 		}
-		
+
+		// reserved (utf-16 implementation)
+		if(codepoint >= 0xD800 && codepoint < 0xE000){
+			bad_char_score += 1;
+		}
+
 		// private use
 		if(codepoint >= 0xE000 && codepoint < 0xF900){
-			bad_char_score += 2;
+			bad_char_score += 1;
+		}
+
+		// misc symbols / pictographs
+		if(codepoint >= 0x1F300 && codepoint < 0x1F600){
+			bad_char_score += 1;
+		}
+
+		// supplemental symbols / pictographs
+		if(codepoint >= 0x1F900 && codepoint < 0x1FA00){
+			bad_char_score += 1;
+		}
+
+		// emoticons
+		if(codepoint >= 0x1F600 && codepoint < 0x1F650){
+			bad_char_score += 1;
+		}
+
+		// transport / map symbols
+		if(codepoint >= 0x1F680 && codepoint < 0x1F700){
+			bad_char_score += 1;
+		}
+
+		// misc symbols
+		if(codepoint >= 0x2600 && codepoint < 0x2700){
+			bad_char_score += 1;
+		}
+
+		// dingbats
+		if(codepoint >= 0x2700 && codepoint < 0x27C0){
+			bad_char_score += 1;
 		}
 
 		if(ispunct(codepoint)){
@@ -179,20 +221,19 @@ static int am_score_ascii_art(const Suspect* s, const char* msg, size_t len){
 		ptr += ret;
 	}
 
+	bad_char_score *= 13;
+
 	// invalid sequences?
 	if(ret == -1){
 		bad_char_score += 60;
 	}
 
-	// symbol spam
-	if(len >= 10 && (punct / (float)len) > 0.4f){
-		bad_char_score += 60;
-	}
-
+#ifdef TRIGGER_HAPPY
 	// same char spam
 	if(max_same >= 8){
 		bad_char_score += (60 + (max_same - 8) * 5);
 	}
+#endif
 
 	return bad_char_score;
 }
@@ -244,6 +285,7 @@ static int am_score_links(const Suspect* s, const char* msg, size_t len){
 	return 0;
 }
 
+#ifdef TRIGGER_HAPPY
 static int am_score_flood(const Suspect* s, const char* msg, size_t len){
 	time_t now = time(0);
 
@@ -253,187 +295,22 @@ static int am_score_flood(const Suspect* s, const char* msg, size_t len){
 		return 0;
 	}
 }
-
-// only global twitch emotes for now
-static const char* emotes[] = {
-  "4Head",
-  "AMPEnergy",
-  "AMPEnergyCherry",
-  "AMPTropPunch",
-  "ANELE",
-  "ArgieB8",
-  "ArsonNoSexy",
-  "AsianGlow",
-  "AthenaPMS",
-  "BabyRage",
-  "BatChest",
-  "BCouch",
-  "BCWarrior",
-  "BibleThump",
-  "BigBrother",
-  "BlargNaut",
-  "bleedPurple",
-  "BloodTrail",
-  "BORT",
-  "BrainSlug",
-  "BrokeBack",
-  "BudBlast",
-  "BuddhaBar",
-  "BudStar",
-  "ChefFrank",
-  "cmonBruh",
-  "CoolCat",
-  "copyThis",
-  "CorgiDerp",
-  "CurseLit",
-  "DAESuppy",
-  "DansGame",
-  "DatSheffy",
-  "DBstyle",
-  "deIlluminati",
-  "DendiFace",
-  "DogFace",
-  "DoritosChip",
-  "duDudu",
-  "DxAbomb",
-  "DxCat",
-  "EagleEye",
-  "EleGiggle",
-  "FailFish",
-  "FPSMarksman",
-  "FrankerZ",
-  "FreakinStinkin",
-  "FUNgineer",
-  "FunRun",
-  "FutureMan",
-  "GingerPower",
-  "GivePLZ",
-  "GrammarKing",
-  "HassaanChop",
-  "HassanChop",
-  "HeyGuys",
-  "HotPokket",
-  "HumbleLife",
-  "imGlitch",
-  "ItsBoshyTime",
-  "Jebaited",
-  "JKanStyle",
-  "JonCarnage",
-  "KAPOW",
-  "Kappa",
-  "KappaClaus",
-  "KappaPride",
-  "KappaRoss",
-  "KappaWealth",
-  "Keepo",
-  "KevinTurtle",
-  "KingMe",
-  "Kippa",
-  "Kreygasm",
-  "Mau5",
-  "mcaT",
-  "MikeHogu",
-  "MingLee",
-  "MrDestructoid",
-  "MVGame",
-  "NervousMonkey",
-  "NinjaTroll",
-  "NomNom",
-  "NoNoSpot",
-  "NotATK",
-  "NotLikeThis",
-  "OhMyDog",
-  "OMGScoots",
-  "OneHand",
-  "OpieOP",
-  "OptimizePrime",
-  "OSfrog",
-  "OSkomodo",
-  "OSsloth",
-  "panicBasket",
-  "PanicVis",
-  "PartyTime",
-  "pastaThat",
-  "PeoplesChamp",
-  "PermaSmug",
-  "PeteZaroll",
-  "PeteZarollTie",
-  "PicoMause",
-  "PipeHype",
-  "PJSalt",
-  "PJSugar",
-  "PMSTwin",
-  "PogChamp",
-  "Poooound",
-  "PraiseIt",
-  "PRChase",
-  "PrimeMe",
-  "PunchTrees",
-  "PuppeyFace",
-  "RaccAttack",
-  "RalpherZ",
-  "RedCoat",
-  "ResidentSleeper",
-  "riPepperonis",
-  "RitzMitz",
-  "RuleFive",
-  "SeemsGood",
-  "ShadyLulu",
-  "ShazBotstix",
-  "SmoocherZ",
-  "SMOrc",
-  "SoBayed",
-  "SoonerLater",
-  "SSSsss",
-  "StinkyCheese",
-  "StoneLightning",
-  "StrawBeary",
-  "SuperVinlin",
-  "SwiftRage",
-  "TakeNRG",
-  "TBCheesePull",
-  "TBTacoLeft",
-  "TBTacoRight",
-  "TF2John",
-  "TheRinger",
-  "TheTarFu",
-  "TheThing",
-  "ThunBeast",
-  "TinyFace",
-  "TooSpicy",
-  "TriHard",
-  "TTours",
-  "twitchRaid",
-  "TwitchRPG",
-  "UleetBackup",
-  "UncleNox",
-  "UnSane",
-  "VoHiYo",
-  "VoteNay",
-  "VoteYea",
-  "WholeWheat",
-  "WTRuck",
-  "WutFace",
-  "YouWHY",
-  NULL
-};
+#endif
 
 static int am_score_emotes(const Suspect* s, const char* msg, size_t len){
 	int emote_count = 0;
+	int i = 0;
+	const char *k, *v;
 
-	for(const char** e = emotes; *e; ++e){
-		const char* p = msg;
-		while((p = strstr(p, *e))){
-			++emote_count;
-			p += strlen(*e);
+	while(ctx->get_tag(i++, &k, &v)){
+		if(strcmp(k, "emotes") != 0) continue;
+		for(; *v; ++v){
+			if(*v == ':' || *v == ',') ++emote_count;
 		}
-
-		if(emote_count > 5){
-			break;
-		}
+		break;
 	}
 
-	return emote_count >= 5 ? 100 : emote_count * 5;
+	return emote_count >= 5 ? 100 : emote_count * 10;
 }
 
 static void automod_discipline(Suspect* s, const char* chan, const char* reason){
@@ -451,7 +328,7 @@ static void automod_discipline(Suspect* s, const char* chan, const char* reason)
 			;
 
 		ctx->send_msg(chan, ".timeout %s %d %s", s->name, timeout, reason);
-		ctx->send_msg(chan, "Timed out %s (%s)", s->name, reason);
+		ctx->send_msg(chan, "Timed out %s (%s)", inso_dispname(ctx, s->name), reason);
 	} else {
 		char buf[512];
 		snprintf(buf, sizeof(buf), "KICK %s %s :%s", chan, s->name, reason);
@@ -473,6 +350,9 @@ static void automod_msg(const char* chan, const char* name, const char* msg){
 	bool discipline = false;
 	int score = 0;
 
+#ifdef TRIGGER_HAPPY
+	const char* rules[] = { "caps", "symbol spam", "flood", "emotes", "spambot?" };
+
 	int (*score_fns[])(const Suspect*, const char*, size_t) = {
 		am_score_caps,
 		am_score_ascii_art,
@@ -480,8 +360,15 @@ static void automod_msg(const char* chan, const char* name, const char* msg){
 		am_score_emotes,
 		am_score_links
 	};
+#else
+	const char* rules[] = { "symbol spam", "emotes", "spambot?" };
 
-	const char* rules[] = { "caps", "ascii art", "flood", "emotes", "spambot?" };
+	int (*score_fns[])(const Suspect*, const char*, size_t) = {
+		am_score_ascii_art,
+		am_score_emotes,
+		am_score_links
+	};
+#endif
 
 	size_t len = strlen(msg);
 
