@@ -23,14 +23,14 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_quit     = &quotes_quit,
 	.on_ipc      = &quotes_ipc,
 	.commands    = DEFINE_CMDS (
-		[GET_QUOTE]     = CMD1"q    "CMD1"quote",
-		[ADD_QUOTE]     = CMD1"qadd "CMD1"q+ " CMD1"addquote",
-		[DEL_QUOTE]     = CMD1"qdel "CMD1"q- " CMD1"delquote",
-		[FIX_QUOTE]     = CMD1"qfix "CMD1"qmv "      CMD1"fixquote",
-		[FIX_TIME]      = CMD1"qft  "CMD1"qfixtime " CMD1"fixquotetime",
-		[LIST_QUOTES]   = CMD1"ql   "CMD1"qlist",
-		[SEARCH_QUOTES] = CMD1"qs   "CMD1"qsearch "  CMD1"qfind " CMD1"qgrep " CMD1"sq",
-		[GET_RANDOM]    = CMD1 "qr "   CMD1 "qrand "   CMD1 "qrandom " CMD1"rq"
+		[GET_QUOTE]     = CONTROL_CHAR"q    "CONTROL_CHAR"quote",
+		[ADD_QUOTE]     = CONTROL_CHAR"qadd "CONTROL_CHAR"q+ " CONTROL_CHAR"addquote",
+		[DEL_QUOTE]     = CONTROL_CHAR"qdel "CONTROL_CHAR"q- " CONTROL_CHAR"delquote",
+		[FIX_QUOTE]     = CONTROL_CHAR"qfix "CONTROL_CHAR"qmv "      CONTROL_CHAR"fixquote",
+		[FIX_TIME]      = CONTROL_CHAR"qft  "CONTROL_CHAR"qfixtime " CONTROL_CHAR"fixquotetime",
+		[LIST_QUOTES]   = CONTROL_CHAR"ql   "CONTROL_CHAR"qlist",
+		[SEARCH_QUOTES] = CONTROL_CHAR"qs   "CONTROL_CHAR"qsearch "  CONTROL_CHAR"qfind " CONTROL_CHAR"qgrep " CONTROL_CHAR"sq",
+		[GET_RANDOM]    = CONTROL_CHAR "qr "   CONTROL_CHAR "qrand "   CONTROL_CHAR "qrandom " CONTROL_CHAR"rq"
 	)
 };
 

@@ -2,7 +2,7 @@
 #include "config.h"
 #include <regex.h>
 #include <curl/curl.h>
-#include "utils.h"
+#include "inso_utils.h"
 
 enum { GOOGLE, DDG, MSDN, };
 

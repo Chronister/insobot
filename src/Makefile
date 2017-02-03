@@ -9,7 +9,7 @@ common_h := $(wildcard inso_*.h)
 common_o := $(patsubst %.h,../lib/%.o,$(common_h))
 
 lz     != pkg-config --libs zlib  2>/dev/null
-lyajl  != pkg-config --libs yajl  2>/dev/null
+lyajl  := -lyajl
 lcairo != pkg-config --libs cairo 2>/dev/null
 
 ifndef lyajl

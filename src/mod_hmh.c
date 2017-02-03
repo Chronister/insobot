@@ -26,14 +26,9 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_mod_msg = &hmh_mod_msg,
 	.on_ipc     = &hmh_ipc,
 	.commands = DEFINE_CMDS (
-<<<<<<< HEAD
 		[CMD_SCHEDULE] = CONTROL_CHAR "sched " CONTROL_CHAR "schedule",
-		[CMD_TIME]     = CONTROL_CHAR "tm "    CONTROL_CHAR "time "     CONTROL_CHAR "when " CONTROL_CHAR "next " CONTROL_CHAR "timer"
-=======
-		[CMD_SCHEDULE] = CMD1("schedule"),
-		[CMD_TIME]     = CMD1("tm") CMD1("time") CMD1("when"),
+		[CMD_TIME]     = CONTROL_CHAR "tm "    CONTROL_CHAR "time "     CONTROL_CHAR "when " CONTROL_CHAR "next " CONTROL_CHAR "timer",
 		[CMD_QA]       = "!qa"
->>>>>>> 74962262bf4623af74aa2c907bfbe8aa20a5abca
 	)
 };
 
