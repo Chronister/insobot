@@ -115,7 +115,7 @@ static void bonus_cmd(const char* chan, const char* name, const char* msg, int c
                 int drops;
             } dice_params;
             dice_params.dice = -1;
-            dice_params.faces = -1;
+            dice_params.faces = 6;
             dice_params.drops = -1;
             for (char* cur = num_start; ; ++cur) {
                 if (parse_state == DICE_NUMDICE) {
@@ -179,8 +179,8 @@ static void bonus_cmd(const char* chan, const char* name, const char* msg, int c
                 }
             }
 
-            if (dice_params.faces < 0) {
-                ctx->send_msg(chan, "I don't have any dice with %d faces...", dice_params.dice);
+            if (dice_params.faces <= 0) {
+                ctx->send_msg(chan, "I don't have any dice with %d faces...", dice_params.faces);
                 return;
             }
             if (dice_params.dice < 0) {
@@ -205,7 +205,11 @@ static void bonus_cmd(const char* chan, const char* name, const char* msg, int c
                 ctx->send_msg(chan, "I rolled the sphere, and it rolled off the table!");
                 return;
             }
-            if (dice_params.drops > dice_params.dice) {
+            if (dice_params.dice == 0) {
+                ctx->send_msg(chan, "No dice.");
+                return;
+            }
+            if (dice_params.drops >= dice_params.dice) {
                 ctx->send_msg(chan, "Whoops, I dropped all the dice!");
                 return;
             }
