@@ -2,6 +2,7 @@
 #include "stb_sb.h"
 #include <string.h>
 #include <ctype.h>
+#include <curl/curl.h>
 #include "inso_utils.h"
 
 static void alias_msg      (const char*, const char*, const char*);
@@ -12,7 +13,7 @@ static void alias_modified (void);
 static void alias_quit     (void);
 static void alias_mod_msg  (const char*, const IRCModMsg*);
 
-enum { ALIAS_ADD, ALIAS_ADD_GLOBAL, ALIAS_DEL, ALIAS_DEL_GLOBAL, ALIAS_LIST, ALIAS_SET_PERM };
+enum { ALIAS_ADD, ALIAS_ADD_GLOBAL, ALIAS_DEL, ALIAS_DEL_GLOBAL, ALIAS_LIST, ALIAS_LIST_GLOBAL, ALIAS_SET_PERM };
 
 const IRCModuleCtx irc_mod_ctx = {
 	.name        = "alias",
@@ -27,12 +28,13 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_quit     = &alias_quit,
 	.on_mod_msg  = &alias_mod_msg,
 	.commands    = DEFINE_CMDS (
-		[ALIAS_ADD]        = CMD1("alias"     ),
-		[ALIAS_ADD_GLOBAL] = CMD1("galias"    ),
-		[ALIAS_DEL]        = CMD1("unalias"   ) CMD1("delalias" ) CMD1("rmalias"    ),
-		[ALIAS_DEL_GLOBAL] = CMD1("gunalias"  ) CMD1("gdelalias") CMD1("grmalias"   ),
-		[ALIAS_LIST]       = CMD1("lsalias"   ) CMD1("lsa"      ) CMD1("listalias"  ) CMD1("listaliases"),
-		[ALIAS_SET_PERM]   = CMD1("chaliasmod") CMD1("chamod"   ) CMD1("aliasaccess") CMD1("setaliasaccess")
+		[ALIAS_ADD]         = CMD1("alias"     ),
+		[ALIAS_ADD_GLOBAL]  = CMD1("galias"    ),
+		[ALIAS_DEL]         = CMD1("unalias"   ) CMD1("delalias" ) CMD1("rmalias"    ),
+		[ALIAS_DEL_GLOBAL]  = CMD1("gunalias"  ) CMD1("gdelalias") CMD1("grmalias"   ),
+		[ALIAS_LIST]        = CMD1("lsalias"   ) CMD1("lsa"      ) CMD1("listalias"  ) CMD1("listaliases"),
+		[ALIAS_LIST_GLOBAL] = CMD1("lsgalias"  ) CMD1("lsga"     ),
+		[ALIAS_SET_PERM]    = CMD1("chaliasmod") CMD1("chamod"   ) CMD1("aliasaccess") CMD1("setaliasaccess")
 	)
 };
 
@@ -59,6 +61,7 @@ typedef struct {
 	int permission;
 	bool me_action;
 	char* msg;
+	time_t last_use; // should technically be per channel
 } Alias;
 
 static char*** alias_keys;
@@ -74,6 +77,7 @@ static void alias_load(){
 	if(fscanf(f, "VERSION %d\n", &save_format_ver) == 1){
 		if(save_format_ver != 2){
 			fprintf(stderr, "Unknown save format version %d! Can't load any aliases.\n", save_format_ver);
+			fclose(f);
 			return;
 		}
 
@@ -140,8 +144,8 @@ static bool alias_init(const IRCCoreCtx* _ctx){
 }
 
 static void alias_quit(void){
-	for(int i = 0; i < sb_count(alias_keys); ++i){
-		for(int j = 0; j < sb_count(alias_keys[i]); ++j){
+	for(size_t i = 0; i < sb_count(alias_keys); ++i){
+		for(size_t j = 0; j < sb_count(alias_keys[i]); ++j){
 			free(alias_keys[i][j]);
 		}
 		sb_free(alias_keys[i]);
@@ -169,8 +173,8 @@ static int alias_find(const char* chan, const char* key, int* idx, int* sub_idx)
 		char full_key[strlen(chan) + strlen(key) + 2];
 		snprintf(full_key, sizeof(full_key), "%s,%s", chan, key);
 
-		for(int i = 0; i < sb_count(alias_keys); ++i){
-			for(int j = 0; j < sb_count(alias_keys[i]); ++j){
+		for(size_t i = 0; i < sb_count(alias_keys); ++i){
+			for(size_t j = 0; j < sb_count(alias_keys[i]); ++j){
 				if(strcasecmp(full_key, alias_keys[i][j]) == 0){
 					if(idx) *idx = i;
 					if(sub_idx) *sub_idx = j;
@@ -180,8 +184,8 @@ static int alias_find(const char* chan, const char* key, int* idx, int* sub_idx)
 		}
 	}
 	
-	for(int i = 0; i < sb_count(alias_keys); ++i){
-		for(int j = 0; j < sb_count(alias_keys[i]); ++j){
+	for(size_t i = 0; i < sb_count(alias_keys); ++i){
+		for(size_t j = 0; j < sb_count(alias_keys[i]); ++j){
 			if(strcasecmp(key, alias_keys[i][j]) == 0){
 				if(idx) *idx = i;
 				if(sub_idx) *sub_idx = j;
@@ -227,9 +231,14 @@ static void alias_add(const char* chan, const char* key, const char* msg, int pe
 }
 
 static void alias_del(int idx, int sub_idx){
+	free(alias_keys[idx][sub_idx]);
 	sb_erase(alias_keys[idx], sub_idx);
+
 	if(sb_count(alias_keys[idx]) == 0){
+		sb_free(alias_keys[idx]);
 		sb_erase(alias_keys, idx);
+
+		free(alias_vals[idx].msg);
 		sb_erase(alias_vals, idx);
 	}
 }
@@ -263,7 +272,7 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 				int idx, sub_idx;
 				if(alias_find(chan, key, &idx, &sub_idx) == ALIAS_FOUND_CHAN){
 					if(alias_vals[idx].permission == AP_ADMINONLY && !is_admin){
-						ctx->send_msg("%s: You don't have permission to change %s.\n", name, key);
+						ctx->send_msg("%s: You don't have permission to change %s.", name, key);
 						break;
 					} else {
 						alias_del(idx, sub_idx);
@@ -309,11 +318,11 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 
 			if(found == ALIAS_FOUND_CHAN){
 				if(alias_vals[idx].permission == AP_ADMINONLY && !is_admin){
-					ctx->send_msg("%s: You don't have permission to delete %s.\n", name, arg);
+					ctx->send_msg("%s: You don't have permission to delete %s.", name, arg);
 					break;
 				} else {
 					alias_del(idx, sub_idx);
-					ctx->send_msg(chan, "%s: Removed alias %s.\n", name, arg);
+					ctx->send_msg(chan, "%s: Removed alias %s.", name, arg);
 				}
 			} else if(found == ALIAS_FOUND_GLOBAL){
 				//TODO: create a blank alias for this channel to disable the global one only here.
@@ -329,11 +338,11 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 			int idx, sub_idx;
 			if(alias_find(NULL, arg, &idx, &sub_idx)){
 				if(alias_vals[idx].permission == AP_ADMINONLY && !is_admin){
-					ctx->send_msg("%s: You don't have permission to change %s.\n", name, arg);
+					ctx->send_msg("%s: You don't have permission to change %s.", name, arg);
 					break;
 				} else {
 					alias_del(idx, sub_idx);
-					ctx->send_msg(chan, "%s: Removed global alias %s.\n", name, arg);
+					ctx->send_msg(chan, "%s: Removed global alias %s.", name, arg);
 				}
 			} else {
 				ctx->send_msg(chan, "%s: That global alias doesn't exist.", name);
@@ -341,59 +350,57 @@ static void alias_cmd(const char* chan, const char* name, const char* arg, int c
 		} break;
 
 		case ALIAS_LIST: {
-			//XXX: this is probably over-complicated
+			char alias_buf[512];
+			char* alias_ptr = alias_buf;
+			size_t alias_sz = sizeof(alias_buf);
 
-			const char** aliases_to_print = NULL;
-			const size_t total = sb_count(alias_keys);
+			// NOTE: only prints the first key if there are multiple per alias
 
-			for(int i = 0; i < total; ++i){
-				const size_t subtotal = sb_count(alias_keys[i]);
-
-				for(int j = 0; j < subtotal; ++j){
+			for(size_t i = 0; i < sb_count(alias_keys); ++i){
+				for(size_t j = 0; j < sb_count(alias_keys[i]); ++j){
 					const char* key = alias_keys[i][j];
 
-					// channel specific alias, only print if the channel matches
 					if(!alias_valid_1st_char(*key)){
 						char* endptr = strchr(key, ',');
 						if(endptr && strncmp(chan, key, endptr - key) == 0){
 							key = endptr + 1;
-						} else {
-							key = NULL;
-						}
-					}
-
-					if(key){
-						bool already_printed = false;
-						for(int k = 0; k < sb_count(aliases_to_print); ++k){
-							if(strcmp(aliases_to_print[k], key) == 0){
-								already_printed = true;
-								break;
-							}
-						}
-
-						if(!already_printed){
-							sb_push(aliases_to_print, key);
+							snprintf_chain(&alias_ptr, &alias_sz, "!%s ", key);
+							break;
 						}
 					}
 				}
 			}
 
+			if(alias_ptr == alias_buf){
+				strcpy(alias_buf, "(none)");
+			}
+
+			ctx->send_msg(chan, "%s: Aliases in %s: %s", inso_dispname(ctx, name), chan, alias_buf);
+		} break;
+
+		case ALIAS_LIST_GLOBAL: {
 			char alias_buf[512];
-			char* ptr = alias_buf;
-			size_t sz = sizeof(alias_buf);
-		
-			if(sb_count(aliases_to_print) == 0){
-				strcpy(alias_buf, "<none>.");
-			} else {
-				for(int i = 0; i < sb_count(aliases_to_print); ++i){
-					const bool last = i == sb_count(aliases_to_print) - 1;
-					snprintf_chain(&ptr, &sz, "!%s%s", aliases_to_print[i], last ? "." : ", ");
+			char* alias_ptr = alias_buf;
+			size_t alias_sz = sizeof(alias_buf);
+
+			// NOTE: only prints the first key if there are multiple per alias
+
+			for(size_t i = 0; i < sb_count(alias_keys); ++i){
+				for(size_t j = 0; j < sb_count(alias_keys[i]); ++j){
+					const char* key = alias_keys[i][j];
+
+					if(alias_valid_1st_char(*key)){
+						snprintf_chain(&alias_ptr, &alias_sz, "!%s ", key);
+						break;
+					}
 				}
 			}
 
-			sb_free(aliases_to_print);
+			if(alias_ptr == alias_buf){
+				strcpy(alias_buf, "(none)");
+			}
 
-			ctx->send_msg(chan, "%s: Current aliases: %s", name, alias_buf);
+			ctx->send_msg(chan, "%s: Global aliases: %s", inso_dispname(ctx, name), alias_buf);
 		} break;
 
 		//FIXME: potential issues:
@@ -448,7 +455,6 @@ usage_setperm:
 }
 
 static void alias_msg(const char* chan, const char* name, const char* msg){
-
 	if(*msg != ALIAS_CHAR || !alias_valid_1st_char(msg[1])) return;
 
 	const char* key = strndupa(msg+1, strchrnul(msg, ' ') - (msg+1));
@@ -470,6 +476,14 @@ static void alias_msg(const char* chan, const char* name, const char* msg){
 	char* msg_buf = NULL;
 
 	Alias* value = alias_vals + idx;
+
+	// don't repeat the same alias too soon
+	time_t now = time(0);
+	if(now - value->last_use <= 5){
+		return;
+	}
+	value->last_use = now;
+
 	bool has_cmd_perms = (value->permission == AP_NORMAL) || strcasecmp(chan+1, name) == 0;
 	if(!has_cmd_perms){
 		if (value->permission == AP_WHITELISTED){
@@ -483,17 +497,31 @@ static void alias_msg(const char* chan, const char* name, const char* msg){
 	}
 	if(!has_cmd_perms) return;
 
+	char*  urlenc_arg;
+	size_t urlenc_arg_len;
+	{
+		CURL* why_do_i_need_this = curl_easy_init();
+		urlenc_arg = curl_easy_escape(why_do_i_need_this, arg, arg_len);
+		urlenc_arg_len = urlenc_arg ? strlen(urlenc_arg) : 0;
+		curl_easy_cleanup(why_do_i_need_this);
+	}
+
 	for(const char* str = value->msg + (value->me_action ? 3 : 0); *str; ++str){
-		if(*str == '%' && *(str + 1) == 't'){
+		if(str[0] == '%' && str[1] == 't'){
 			memcpy(sb_add(msg_buf, name_len), name, name_len);
 			++str;
-		} else if(*str == '%' && *(str + 1) == 'a'){
-			if(arg && *arg && arg_len){
+		} else if(str[0] == '%' && str[1] == 'a'){
+			if(*arg){
 				memcpy(sb_add(msg_buf, arg_len), arg, arg_len);
 			}
 			++str;
-		} else if(*str == '%' && *(str + 1) == 'n'){
-			if(arg && *arg && arg_len){
+		} else if(str[0] == '%' && str[1] == 'u'){
+			if(urlenc_arg && *urlenc_arg){
+				memcpy(sb_add(msg_buf, urlenc_arg_len), urlenc_arg, urlenc_arg_len);
+			}
+			++str;
+		} else if(str[0] == '%' && str[1] == 'n'){
+			if(*arg){
 				memcpy(sb_add(msg_buf, arg_len), arg, arg_len);
 			} else {
 				memcpy(sb_add(msg_buf, name_len), name, name_len);
@@ -516,12 +544,13 @@ static void alias_msg(const char* chan, const char* name, const char* msg){
 	}
 
 	sb_free(msg_buf);
+	curl_free(urlenc_arg);
 }
 
 static bool alias_save(FILE* file){
 	fputs("VERSION 2\n", file);
-	for(int i = 0; i < sb_count(alias_keys); ++i){
-		for(int j = 0; j < sb_count(alias_keys[i]); ++j){
+	for(size_t i = 0; i < sb_count(alias_keys); ++i){
+		for(size_t j = 0; j < sb_count(alias_keys[i]); ++j){
 			fprintf(file, "%s ", alias_keys[i][j]);
 		}
 

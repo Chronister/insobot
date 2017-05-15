@@ -3,28 +3,34 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <string.h>
+#include <locale.h>
 #include <ctype.h>
 #include <assert.h>
 #include <errno.h>
 #include <err.h>
 #include <time.h>
-#include <sys/time.h>
-#include <sys/stat.h>
 #include <fcntl.h>
-#include <sys/inotify.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <signal.h>
 #include <unistd.h>
 #include <limits.h>
 #include <glob.h>
 #include <dlfcn.h>
 #include <link.h>
-#include <pthread.h>
+#include <execinfo.h>
+
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <sys/inotify.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
 #include <libircclient.h>
 #include <libirc_rfcnumeric.h>
 #include <curl/curl.h>
-#include <locale.h>
+
 #include "config.h"
 #include "module.h"
 #include "stb_sb.h"
@@ -39,8 +45,8 @@
 	#define __auto_type intptr_t
 #endif
 
-_Static_assert(sizeof(intptr_t) == sizeof(void*), "uh oh");
-_Static_assert(sizeof(void (*)) == sizeof(void*), "uh oh");
+_Static_assert(sizeof(intptr_t)   == sizeof(void*), "uh oh");
+_Static_assert(sizeof(void (*)()) == sizeof(void*), "uh oh");
 
 /******************************
  * Types, global vars, macros *
@@ -50,6 +56,7 @@ typedef struct Module_ {
 	char* lib_path;
 	void* lib_handle;
 	IRCModuleCtx* ctx;
+	size_t ctx_size;
 	bool needs_reload, data_modified;
 } Module;
 
@@ -64,6 +71,7 @@ typedef struct INotifyData_ {
 } INotifyData;
 
 typedef struct IRCCmd_ {
+	size_t id;
 	int cmd;
 	char *chan, *data;
 } IRCCmd;
@@ -79,6 +87,7 @@ enum { IRC_CMD_JOIN, IRC_CMD_PART, IRC_CMD_MSG, IRC_CMD_RAW };
 
 static IRCCmd* cmd_queue;
 static uint32_t prev_cmd_ms;
+static size_t last_cmd_id;
 
 static irc_session_t* irc_ctx;
 
@@ -110,6 +119,10 @@ static bool send_msg_called;
 static char   irc_tag_buf[512];
 static char** irc_tag_ptrs;
 static bool   have_tag_hack;
+
+static int pipe_fds[2];
+static int debug_pipe[2];
+static const char* debug_chan;
 
 #define IRC_CALLBACK_BASE(name, event_type) static void irc_##name ( \
 	irc_session_t* session, \
@@ -149,6 +162,15 @@ static bool   have_tag_hack;
 		}                                                       \
 	}
 
+#define IRC_MOD_CALL_ALL_ABI(ptr, args, abi)                    \
+	for(Module* m = irc_modules; m < sb_end(irc_modules); ++m){ \
+		if(ABI_CHECK(m, abi)) IRC_MOD_CALL(m, ptr, args);       \
+	}
+
+#define ABI_FILTER  24
+#define ABI_UNKNOWN 25
+#define ABI_CHECK(m, abi) ((m)->ctx_size >= (sizeof(void*)*(abi)))
+
 /*********************************
  * Required forward declarations *
  *********************************/
@@ -164,46 +186,120 @@ static void        util_ipc_del(const char* name);
  * Helper funcs *
  ****************/
 
-static void* util_log_thread_main(void* _arg){
-	int* fds = _arg;
-	int orig_stdout = fds[0];
-	int pipe_fd = fds[1];
-
+static void util_log_proc(int fd, pid_t pid){
+	char text_buf[1024];
 	char time_buf[64];
-	char c;
 
-	bool do_time = true;
+	FILE* f = fdopen(dup(fd), "r");
 
-	while(true){
-		do {
-			ssize_t result = read(pipe_fd, &c, 1);
-			if(result <= 0){
-				dprintf(orig_stdout, "read: %s\n", strerror(errno));
-				continue;
-			}
-
-			if(do_time){
-				time_t now = time(0);
-				size_t time_size = strftime(time_buf, sizeof(time_buf), "[%F %T] ", localtime(&now));
-				if(write(orig_stdout, time_buf, time_size) == -1){
-					perror("log_thread write");
-				}
-				do_time = false;
-			}
-
-			if(write(orig_stdout, &c, 1) == -1){
-				perror("log_thread write");
-			}
-		} while(c != '\n');
-
-		do_time = true;
+	while(running){
+		if(!fgets(text_buf, sizeof(text_buf), f)) break;
+		time_t now = time(0);
+		strftime(time_buf, sizeof(time_buf), "[%F %T]", localtime(&now));
+		printf("%s %s", time_buf, text_buf);
 	}
 
-	return NULL;
+	fclose(f);
 }
 
 static void util_handle_sig(int n){
-	running = 0;
+	if(n == SIGSEGV){
+		void* buf[32];
+		int size = backtrace(buf, 32);
+		fputs("########## SIGSEGV BACKTRACE ##########\n", stderr);
+		backtrace_symbols_fd(buf, size, STDERR_FILENO);
+		fputs("##########        END        ##########\n", stderr);
+
+		signal(SIGSEGV, SIG_DFL);
+
+		// notify our future self about how we died... 🤔
+		if(getenv("INSOBOT_DEBUG_CHAN") && size > 2){
+			backtrace_symbols_fd(buf + 2, 1, debug_pipe[1]);
+		}
+	} else {
+		running = 0;
+	}
+}
+
+static void util_multiprocess_init(void){
+
+	if(getenv("INSOBOT_DEBUG_CHAN")){
+		if(pipe(debug_pipe) == -1){
+			perror("pipe failed");
+			exit(1);
+		}
+	}
+
+restart:
+	if(pipe(pipe_fds) == -1){
+		perror("pipe failed");
+		exit(1);
+	}
+
+	pid_t pid = fork();
+	if(pid == -1){
+		perror("fork failed");
+		exit(1);
+	}
+
+	// parent process -> will loop in util_log_proc, then either exit or goto restart.
+	if(pid != 0){
+		signal(SIGINT , SIG_IGN);
+		signal(SIGPIPE, &util_handle_sig);
+
+		close(pipe_fds[1]);
+		prctl(PR_SET_NAME, "ib-parent");
+
+		util_log_proc(pipe_fds[0], pid);
+		close(pipe_fds[0]);
+
+		int status;
+		wait(&status);
+
+		int exitnum = 0;
+
+		if(WIFEXITED(status)){
+#if __SANITIZE_ADDRESS__
+			exitnum = 0;
+#else
+			exitnum = WEXITSTATUS(status);
+#endif
+			printf("insobot exited. (%d)\n", exitnum);
+
+		} else if(WIFSIGNALED(status)){
+			int sig = WTERMSIG(status);
+			printf("Somebody set up us the bomb. We get signal: %d (%s).\n", sig, sys_siglist[sig]);
+
+			if(WCOREDUMP(status)){
+				puts("On the bright side, we apparently dumped a core somewhere.");
+			}
+
+			exitnum = (sig == SIGTERM) ? 0 : sig;
+		}
+
+		if(!getenv("INSOBOT_NO_AUTO_RESTART") && exitnum != 0){
+			puts("Gonna try to auto restart...");
+			signal(SIGINT , SIG_DFL);
+			if(usleep(5000000) == -1){
+				exit(1);
+			}
+			goto restart;
+		}
+
+		exit(exitnum);
+	}
+
+	// child process -> points stdout/stderr into the parent pipe, and returns back to main.
+
+	prctl(PR_SET_NAME, "insobot");
+	prctl(PR_SET_PDEATHSIG, SIGINT);
+
+	close(pipe_fds[0]);
+	dup2(pipe_fds[1], STDOUT_FILENO);
+	dup2(pipe_fds[1], STDERR_FILENO);
+
+	setlinebuf(stdout);
+	setlinebuf(stderr);
 }
 
 static inline const char* util_env_else(const char* env, const char* def){
@@ -241,16 +337,22 @@ static void util_dispatch_cmds(Module* m, const char* chan, const char* name, co
 	}
 }
 
-static void util_cmd_enqueue(int cmd, const char* chan, const char* data){
-	if(sb_count(cmd_queue) > CMD_QUEUE_MAX) return;
+static size_t util_cmd_enqueue(int cmd, const char* chan, const char* data){
+	if(sb_count(cmd_queue) > CMD_QUEUE_MAX) return 0;
+
+	size_t id = ++last_cmd_id;
+	if(!id) ++id;
 
 	IRCCmd c = {
+		.id   = id,
 		.cmd  = cmd,
 		.chan = chan ? strdup(chan) : NULL,
 		.data = data ? strdup(data) : NULL
 	};
 
 	sb_push(cmd_queue, c);
+
+	return c.id;
 }
 
 static void util_process_pending_cmds(void){
@@ -268,22 +370,30 @@ static void util_process_pending_cmds(void){
 
 			case IRC_CMD_JOIN: {
 				irc_cmd_join(irc_ctx, cmd.chan, cmd.data);
-				irc_on_join(irc_ctx, "join", cmd.data, (const char**)&cmd.chan, 1);
+//				irc_on_join(irc_ctx, "join", cmd.data, (const char**)&cmd.chan, 1);
 			} break;
 
 			case IRC_CMD_PART: {
 				irc_cmd_part(irc_ctx, cmd.chan);
-				irc_on_part(irc_ctx, "part", cmd.data, (const char**)&cmd.chan, 1);
+//				irc_on_part(irc_ctx, "part", cmd.data, (const char**)&cmd.chan, 1);
 			} break;
 
 			case IRC_CMD_MSG: {
-				printf("send: [%s] [%s]\n", cmd.chan, cmd.data);
-				irc_cmd_msg(irc_ctx, cmd.chan, cmd.data);
-				IRC_MOD_CALL_ALL(on_msg_out, (cmd.chan, cmd.data));
+				size_t len = strlen(cmd.data);
+				IRC_MOD_CALL_ALL_ABI(on_filter, (cmd.id, cmd.chan, cmd.data, len), ABI_FILTER);
+				if(*cmd.data){
+					printf("send: [%s] [%s]\n", cmd.chan, cmd.data);
+					irc_cmd_msg(irc_ctx, cmd.chan, cmd.data);
+					IRC_MOD_CALL_ALL(on_msg_out, (cmd.chan, cmd.data));
+				}
 			} break;
 
 			case IRC_CMD_RAW: {
-				irc_send_raw(irc_ctx, "%s", cmd.data);
+				size_t len = strlen(cmd.data);
+				IRC_MOD_CALL_ALL_ABI(on_filter, (cmd.id, NULL, cmd.data, len), ABI_FILTER);
+				if(*cmd.data){
+					irc_send_raw(irc_ctx, "%s", cmd.data);
+				}
 			} break;
 		}
 
@@ -385,13 +495,14 @@ static void util_reload_modules(const IRCCoreCtx* core_ctx){
 		dlerror();
 		m->lib_handle = dlopen(m->lib_path, RTLD_LAZY | RTLD_LOCAL);
 
-		struct link_map* mod_info = m->lib_handle;
-		printf("Loading module %-20s [0x%zx]\n", mod_name, (size_t)mod_info->l_addr);
+		printf("Loading module %-20s", mod_name);
 
-		const char* errmsg = "NULL lib handle";
-		if(m->lib_handle && !(errmsg = dlerror())){
+		const char* errmsg = dlerror();
+		if(!errmsg && m->lib_handle){
 			m->ctx = dlsym(m->lib_handle, "irc_mod_ctx");
 			errmsg = dlerror();
+		} else if(!errmsg && !m->lib_handle){
+			errmsg = "NULL lib handle.";
 		}
 
 		if(!errmsg){
@@ -399,21 +510,25 @@ static void util_reload_modules(const IRCCoreCtx* core_ctx){
 			Dl_info unused;
 			if(dladdr1(m->ctx, &unused, (void**)&sym, RTLD_DL_SYMENT) == 0){
 				errmsg = "dladdr1 failed.";
-			} else if(sym->st_size < sizeof(IRCModuleCtx)) {
-				// TODO: Use a table of which function pointers were present in the context
-				//       for each size, so that we can retain backwards binary compatibility.
-				//       (assuming new functions are only added to the end of the struct)
+			} else if(sym->st_size < (sizeof(void*)*23)) {
+				
+				// NOTE: ABI Table for IRCModuleCtx:
 				//
 				//       | sizeof(void*) | last field |
 				//       +---------------+------------+
-				//       |      x23      |   on_ipc   |
+				//       |      x23      | on_ipc     |
+				//       |      x24      | on_filter  |
+				//       |      x25      | on_unknown |
 
 				errmsg = "version mismatch (wrong size irc_mod_ctx)";
+			} else {
+				m->ctx_size = sym->st_size;
 			}
 		}
 
 		if(errmsg){
-			fprintf(stderr, "** Error loading module %s: %s\n", mod_name, errmsg);
+			puts("");
+			fprintf(stderr, "** Error loading module %s:\n  %s\n", mod_name, errmsg);
 			if(m->lib_handle){
 				dlclose(m->lib_handle);
 				m->lib_handle = NULL;
@@ -422,6 +537,9 @@ static void util_reload_modules(const IRCCoreCtx* core_ctx){
 			sb_erase(irc_modules, m - irc_modules);
 			--m;
 			continue;
+		} else {
+			struct link_map* mod_info = m->lib_handle;
+			printf("[0x%zx]\n", (size_t)mod_info->l_addr);
 		}
 	}
 
@@ -442,11 +560,15 @@ static void util_reload_modules(const IRCCoreCtx* core_ctx){
 			continue;
 		}
 
-		for(int i = 0; i < sb_count(channels) - 1; ++i){
+		if(irc_ctx && irc_is_connected(irc_ctx)){
+			IRC_MOD_CALL(m, on_connect, (serv));
+		}
+
+		for(size_t i = 0; i < sb_count(channels) - 1; ++i){
 			const char** c = (const char**)channels + i;
 
 			IRC_MOD_CALL(m, on_join, (*c, bot_nick));
-			for(int j = 0; j < sb_count(chan_nicks[i]); ++j){
+			for(size_t j = 0; j < sb_count(chan_nicks[i]); ++j){
 				IRC_MOD_CALL(m, on_join, (*c, chan_nicks[i][j]));
 			}
 		}
@@ -595,10 +717,25 @@ static void util_ipc_init(void){
 
 		globfree(&glob_data);
 	}
+
+	// check for stale peers
+
+	for(IPCAddress* p = ipc_peers; p < sb_end(ipc_peers); ++p){
+		if(connect(ipc_socket, &p->addr, sizeof(p->addr)) == -1){
+			if(errno == ECONNREFUSED){
+				unlink(p->addr.sun_path);
+			}
+			sb_erase(ipc_peers, p - ipc_peers);
+			--p;
+		} else {
+			struct sockaddr sa = { .sa_family = AF_UNSPEC };
+			connect(ipc_socket, &sa, sizeof(sa));
+		}
+	}
 }
 
 static IPCAddress* util_ipc_add(const char* name){
-	for(int i = 0; i < sb_count(ipc_peers); ++i){
+	for(size_t i = 0; i < sb_count(ipc_peers); ++i){
 		if(strcmp(ipc_peers[i].addr.sun_path, name) == 0){
 			return ipc_peers + i;
 		}
@@ -620,7 +757,7 @@ static IPCAddress* util_ipc_add(const char* name){
 }
 
 static void util_ipc_del(const char* name){
-	for(int i = 0; i < sb_count(ipc_peers); ++i){
+	for(size_t i = 0; i < sb_count(ipc_peers); ++i){
 		if(strcmp(ipc_peers[i].addr.sun_path, name) == 0){
 			sb_erase(ipc_peers, i);
 			break;
@@ -657,12 +794,12 @@ static void util_find_chan_nick(const char* chan, const char* nick, int* chan_id
 	if(chan_idx) *chan_idx = -1;
 	if(nick_idx) *nick_idx = -1;
 
-	for(int i = 0; i < sb_count(channels) - 1; ++i){
+	for(size_t i = 0; i < sb_count(channels) - 1; ++i){
 		if(strcasecmp(channels[i], chan) != 0) continue;
 
 		if(chan_idx) *chan_idx = i;
 
-		for(int j = 0; j < sb_count(chan_nicks[i]); ++j){
+		for(size_t j = 0; j < sb_count(chan_nicks[i]); ++j){
 			if(strcasecmp(chan_nicks[i][j], nick) == 0){
 				if(nick_idx) *nick_idx = j;
 				break;
@@ -675,7 +812,7 @@ static void util_find_chan_nick(const char* chan, const char* nick, int* chan_id
 
 static void util_trim_end_spaces(char* msg, size_t len){
 	if(len > 0){
-		for(char* p = msg + len - 1; *p == ' '; --p){
+		for(char* p = msg + len - 1; p >= msg && *p == ' '; --p){
 			*p = 0;
 		}
 	}
@@ -737,8 +874,16 @@ IRC_STR_CALLBACK(on_chat_msg) {
 	util_update_tags(params);
 
 	const char *_chan = params[0], *_name = origin;
-	char* _msg = strdupa(params[1]);
-	util_trim_end_spaces(_msg, strlen(_msg));
+
+	size_t msglen = strlen(params[1]);
+	char*  msgbuf = alloca(msglen+2);
+	char*  _msg   = msgbuf + 1;
+
+	// null-prefix the msg, so that cmds can walk backwards to see the full msg
+	*msgbuf = 0;
+	memcpy(_msg, params[1], msglen+1);
+
+	util_trim_end_spaces(_msg, msglen);
 
 	send_msg_called = false;
 
@@ -796,6 +941,12 @@ IRC_STR_CALLBACK(on_join) {
 		sb_push(chan_nicks[chan_i], strdup(origin));
 	}
 
+	// if we're joining the debug channel, set the global so we know we can now send stuff
+	const char* c = getenv("INSOBOT_DEBUG_CHAN");
+	if(c && strcmp(origin, bot_nick) == 0 && strcmp(params[0], c) == 0){
+		debug_chan = c;
+	}
+
 	//XXX: can't use CHECK here unless our own name bypasses it FIXME
 	IRC_MOD_CALL_ALL(on_join, (params[0], origin));
 }
@@ -812,7 +963,7 @@ IRC_STR_CALLBACK(on_part) {
 		free(channels[chan_i]);
 		sb_erase(channels, chan_i);
 
-		for(int i = 0; i < sb_count(chan_nicks[chan_i]); ++i){
+		for(size_t i = 0; i < sb_count(chan_nicks[chan_i]); ++i){
 			free(chan_nicks[chan_i][i]);
 		}
 		sb_free(chan_nicks[chan_i]);
@@ -833,8 +984,8 @@ IRC_STR_CALLBACK(on_quit) {
 
 	printf("QUIT: %s\n", origin);
 
-	for(int i = 0; i < sb_count(channels) - 1; ++i){
-		for(int j = 0; j < sb_count(chan_nicks[i]); ++j){
+	for(size_t i = 0; i < sb_count(channels) - 1; ++i){
+		for(size_t j = 0; j < sb_count(chan_nicks[i]); ++j){
 			if(strcmp(origin, chan_nicks[i][j]) == 0){
 				free(chan_nicks[i][j]);
 				sb_erase(chan_nicks[i], j);
@@ -857,8 +1008,8 @@ IRC_STR_CALLBACK(on_nick) {
 		bot_nick = strdup(params[0]);
 	}
 
-	for(int i = 0; i < sb_count(channels) - 1; ++i){
-		for(int j = 0; j < sb_count(chan_nicks[i]); ++j){
+	for(size_t i = 0; i < sb_count(channels) - 1; ++i){
+		for(size_t j = 0; j < sb_count(chan_nicks[i]); ++j){
 			if(strcasecmp(chan_nicks[i][j], origin) == 0){
 				free(chan_nicks[i][j]);
 				chan_nicks[i][j] = strdup(params[0]);
@@ -872,15 +1023,18 @@ IRC_STR_CALLBACK(on_nick) {
 
 IRC_STR_CALLBACK(on_unknown) {
 	if(strcmp(event, "PONG") == 0){
-		printf(":: PONG");
+//		printf(":: PONG");
+		return;
 	} else {
 		printf("Unknown event:\n:: %s :: %s", event, origin);
 	}
 
-	for(int i = 0; i < count; ++i){
+	for(size_t i = 0; i < count; ++i){
 		printf(" :: %s", params[i]);
 	}
 	puts("");
+
+	IRC_MOD_CALL_ALL_ABI(on_unknown, (event, origin, params, count), ABI_UNKNOWN);
 }
 
 IRC_NUM_CALLBACK(on_numeric) {
@@ -901,7 +1055,7 @@ IRC_NUM_CALLBACK(on_numeric) {
 		free(names);
 	} else {
 		printf(":: [%03u] :: %s", event, origin);
-		for(int i = 0; i < count; ++i){
+		for(size_t i = 0; i < count; ++i){
 			printf(" :: %s", params[i]);
 		}
 		puts("");
@@ -985,7 +1139,7 @@ static const char** core_get_nicks(const char* chan, int* count){
 	assert(count);
 
 	int index = -1;
-	for(int i = 0; i < sb_count(channels) - 1; ++i){
+	for(size_t i = 0; i < sb_count(channels) - 1; ++i){
 		if(strcasecmp(channels[i], chan) == 0){
 			index = i;
 			break;
@@ -1033,24 +1187,26 @@ static void core_part(const char* chan){
 	}
 }
 
-static void core_send_msg(const char* chan, const char* fmt, ...){
-	if(!chan || !fmt) return;
+static size_t core_send_msg(const char* chan, const char* fmt, ...){
+	if(!chan || !fmt) return 0;
 
+	size_t id = 0;
 	char buff[1024];
 	va_list v;
 
 	va_start(v, fmt);
 	if(vsnprintf(buff, sizeof(buff), fmt, v) > 0){
-		util_cmd_enqueue(IRC_CMD_MSG, chan, buff);
+		id = util_cmd_enqueue(IRC_CMD_MSG, chan, buff);
 	}
+	va_end(v);
 
 	send_msg_called = true;
 
-	va_end(v);
+	return id;
 }
 
-static void core_send_raw(const char* raw){
-	util_cmd_enqueue(IRC_CMD_RAW, NULL, raw);
+static size_t core_send_raw(const char* raw){
+	return util_cmd_enqueue(IRC_CMD_RAW, NULL, raw);
 }
 
 static void core_send_ipc(int target, const void* data, size_t data_len){
@@ -1105,7 +1261,7 @@ static void core_self_save(void){
 
 static void core_log(const char* fmt, ...){
 
-	if(getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
+	if(getenv("INSOBOT_NO_FORK")){
 		char time_buf[64];
 		time_t now = time(0);
 		struct tm* now_tm = localtime(&now);
@@ -1146,37 +1302,84 @@ static bool core_get_tag(size_t index, const char** k, const char** v){
 	return true;
 }
 
+static void core_gen_event(int which, ...){
+	va_list va;
+	va_start(va, which);
+
+	// TODO: get tags in here?
+	const char* pbuf[3] = { "" };
+	const char** params = pbuf + 1;
+	const char* origin;
+
+	// TODO: queue this up in events like cmd_queue, and process later
+
+	switch(which){
+		case IRC_CB_MSG: {
+			params[0] = va_arg(va, const char*); // chan
+			origin    = va_arg(va, const char*); // name
+			params[1] = va_arg(va, const char*); // msg
+
+			irc_on_chat_msg(irc_ctx, "", origin, params, 2);
+		} break;
+
+		case IRC_CB_JOIN: {
+			params[0] = va_arg(va, const char*); // chan;
+			origin    = va_arg(va, const char*); // name;
+
+			irc_on_join(irc_ctx, "", origin, params, 1);
+		} break;
+
+		case IRC_CB_PART: {
+			params[0] = va_arg(va, const char*); // chan;
+			origin    = va_arg(va, const char*); // name;
+
+			irc_on_part(irc_ctx, "", origin, params, 1);
+		} break;
+
+		case IRC_CB_ACTION: {
+			params[0] = va_arg(va, const char*); // chan
+			origin    = va_arg(va, const char*); // name
+			params[1] = va_arg(va, const char*); // msg
+
+			irc_on_action(irc_ctx, "", origin, params, 2);
+		} break;
+
+		case IRC_CB_NICK: {
+			origin    = va_arg(va, const char*); // prev_nick
+			params[0] = va_arg(va, const char*); // new_nick
+
+			irc_on_nick(irc_ctx, "", origin, params, 1);
+		} break;
+
+		case IRC_CB_PM: {
+			// params[0] unused?
+			origin    = va_arg(va, const char*); // name
+			params[1] = va_arg(va, const char*); // msg
+
+			irc_on_pm(irc_ctx, "", origin, params, 2);
+		} break;
+	}
+
+	va_end(va);
+}
+
 /***************
  * entry point *
  * *************/
 
 int main(int argc, char** argv){
 
+	// parent process setup
+
+	if(!getenv("INSOBOT_NO_FORK")){
+		util_multiprocess_init(); // NOTE: only the child process will return from this function
+	}
+
 	srand(time(0));
-	signal(SIGINT, &util_handle_sig);
+	signal(SIGSEGV, &util_handle_sig);
+	signal(SIGINT , &util_handle_sig);
 	signal(SIGPIPE, SIG_IGN);
 	assert(setlocale(LC_CTYPE, "C.UTF-8"));
-
-	// timestamp thread setup
-
-	pthread_t log_thread;
-	
-	if(!getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
-		int fds[3] = { dup(STDOUT_FILENO) };
-
-		if(pipe(fds + 1) == -1){
-			perror("pipe");
-			abort();
-		}
-
-		dup2(fds[2], STDOUT_FILENO);
-		dup2(fds[2], STDERR_FILENO);
-
-		setlinebuf(stdout);
-		setlinebuf(stderr);
-
-		pthread_create(&log_thread, NULL, &util_log_thread_main, fds);
-	}
 
 	// path setup
 
@@ -1192,9 +1395,9 @@ int main(int argc, char** argv){
 		*our_path = '.';
 	}
 
-	const char in_mod_suffix[] = "/modules/";
-	const char in_dat_suffix[] = "/modules/data/";
-	const char glob_suffix[]   = "/modules/*.so";
+	static const char in_mod_suffix[] = "/modules/";
+	static const char in_dat_suffix[] = "/modules/data/";
+	static const char glob_suffix[]   = "/modules/*.so";
 
 	if(path_end + sizeof(in_dat_suffix) >= our_path + sizeof(our_path)){
 		errx(1, "Path too long!");
@@ -1233,7 +1436,7 @@ int main(int argc, char** argv){
 
 	printf("Found %zu modules\n", glob_data.gl_pathc);
 
-	for(int i = 0; i < glob_data.gl_pathc; ++i){
+	for(size_t i = 0; i < glob_data.gl_pathc; ++i){
 		util_module_add(glob_data.gl_pathv[i]);
 	}
 
@@ -1241,7 +1444,7 @@ int main(int argc, char** argv){
 
 	// modules init
 
-	const IRCCoreCtx core_ctx = {
+	static const IRCCoreCtx core_ctx = {
 		.api_version  = INSO_CORE_API_VERSION,
 		.get_info     = &core_get_info,
 		.get_username = &core_get_username,
@@ -1260,16 +1463,18 @@ int main(int argc, char** argv){
 		.strip_colors = &core_strip_colors,
 		.responded    = &core_responded,
 		.get_tag      = &core_get_tag,
+		.gen_event    = &core_gen_event,
 	};
 
 	sb_push(channels, 0);
 
 	// check for patched lib with ircv3 tag parsing hack
-
-	unsigned irc_maj = 0, irc_min = 0;
-	irc_get_version(&irc_maj, &irc_min);
-	if(irc_maj == 1 && irc_min == 0x1b07){
-		have_tag_hack = 1;
+	{
+		unsigned irc_maj = 0, irc_min = 0;
+		irc_get_version(&irc_maj, &irc_min);
+		if(irc_maj == 1 && irc_min == 0x1b07){
+			have_tag_hack = 1;
+		}
 	}
 
 	// initial load of modules
@@ -1288,7 +1493,7 @@ int main(int argc, char** argv){
 	port = util_env_else("IRC_PORT", "6667");
 	bot_nick = strdup(user);
 
-	irc_callbacks_t callbacks = {
+	static irc_callbacks_t callbacks = {
 		.event_connect     = irc_on_connect,
 		.event_channel     = irc_on_chat_msg,
 		.event_privmsg     = irc_on_pm,
@@ -1304,12 +1509,11 @@ int main(int argc, char** argv){
 	// outer main loop, (re)set irc state
 
 	do {
-		irc_ctx = irc_create_session(&callbacks);
-		if(!irc_ctx){
+		if(!(irc_ctx = irc_create_session(&callbacks))){
 			fprintf(stderr, "Failed to create irc session.\n");
+			exit(1);
 		}
 
-		irc_option_set(irc_ctx, LIBIRC_OPTION_DEBUG);
 		irc_option_set(irc_ctx, LIBIRC_OPTION_STRIPNICKS);
 
 		char* libirc_serv;
@@ -1335,8 +1539,6 @@ int main(int argc, char** argv){
 
 			util_process_pending_cmds();
 
-			util_inotify_check(&core_ctx);
-
 			//TODO: check on_meta & better timing for on_tick?
 			time_t now = time(0);
 			IRC_MOD_CALL_ALL(on_tick, (now));
@@ -1346,8 +1548,19 @@ int main(int argc, char** argv){
 	
 			FD_ZERO(&in);
 			FD_ZERO(&out);
+
 			FD_SET(STDIN_FILENO, &in);
-			FD_SET(ipc_socket, &in);
+			FD_SET(ipc_socket  , &in);
+			FD_SET(inotify.fd  , &in);
+
+			max_fd = INSO_MAX(max_fd, STDIN_FILENO);
+			max_fd = INSO_MAX(max_fd, ipc_socket);
+			max_fd = INSO_MAX(max_fd, inotify.fd);
+
+			if(debug_chan && debug_pipe[0]){
+				FD_SET(debug_pipe[0], &in);
+				max_fd = INSO_MAX(max_fd, debug_pipe[0]);
+			}
 
 			if(irc_add_select_descriptors(irc_ctx, &in, &out, &max_fd) != 0){
 				fprintf(stderr, "Error adding select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
@@ -1357,18 +1570,15 @@ int main(int argc, char** argv){
 				.tv_sec  = 0,
 				.tv_usec = 250000,
 			}, orig_tv = tv;
-	
-			int ret = select(max_fd + 1, &in, &out, NULL, &tv);
-				
-			if(ret > 0){
 
-				if(irc_process_select_descriptors(irc_ctx, &in, &out) != 0){
-					fprintf(stderr, "Error processing select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
-				}
+			int select_status = select(max_fd + 1, &in, &out, NULL, &tv);
+
+			if(select_status > 0){
 
 				if(FD_ISSET(STDIN_FILENO, &in)){
+					FD_CLR(STDIN_FILENO, &in);
 					char stdin_buf[1024];
-					ssize_t n =  read(STDIN_FILENO, stdin_buf, sizeof(stdin_buf));
+					ssize_t n = read(STDIN_FILENO, stdin_buf, sizeof(stdin_buf));
 					if(n > 0){
 						stdin_buf[n-1] = 0; // remove \n
 						IRC_MOD_CALL_ALL(on_stdin, (stdin_buf));
@@ -1376,18 +1586,42 @@ int main(int argc, char** argv){
 				}
 
 				if(FD_ISSET(ipc_socket, &in)){
+					FD_CLR(ipc_socket, &in);
 					util_ipc_recv();
 				}
 
+				if(FD_ISSET(inotify.fd, &in)){
+					FD_CLR(inotify.fd, &in);
+					util_inotify_check(&core_ctx);
+				}
+
+				if(FD_ISSET(debug_pipe[0], &in)){
+					FD_CLR(debug_pipe[0], &in);
+					char buf[256];
+					char* fname;
+					int off;
+					size_t n = read(debug_pipe[0], buf, sizeof(buf)-1);
+
+					if(n > 0 && sscanf(buf, "%m[^(]%n", &fname, &off) == 1){
+						buf[n-1] = 0; // remove \n
+						core_send_msg(debug_chan, "Recovered from crash: %s%s", basename(fname), buf + off);
+						free(fname);
+					}
+				}
+
 				for(int i = 0; i < max_fd + 1; ++i){
-					if(i != STDIN_FILENO && i != ipc_socket && FD_ISSET(i, &in)){
+					if(FD_ISSET(i, &in)){
 						timerclear(&idle_tv);
 						ping_sent = 0;
 						break;
 					}
 				}
 
-			} else if(ret == 0){
+				if(irc_process_select_descriptors(irc_ctx, &in, &out) != 0){
+					fprintf(stderr, "Error processing select fds: %s\n", irc_strerror(irc_errno(irc_ctx)));
+				}
+
+			} else if(select_status == 0){
 
 				struct timeval ping_tv    = { .tv_sec = 60 };
 				struct timeval restart_tv = { .tv_sec = 90 };
@@ -1395,12 +1629,9 @@ int main(int argc, char** argv){
 				timeradd(&orig_tv, &idle_tv, &idle_tv);
 
 				if(!ping_sent && timercmp(&idle_tv, &ping_tv, >)){
-					puts("Reached idle time threshold, sending PING.");
 					irc_send_raw(irc_ctx, "PING %s", serv);
 					ping_sent = 1;
-				}
-
-				if(ping_sent && timercmp(&idle_tv, &restart_tv, >)){
+				} else if(ping_sent && timercmp(&idle_tv, &restart_tv, >)){
 					puts("Reached 'no PONG' threshold, disconnecting."); 
 					irc_disconnect(irc_ctx);
 				}
@@ -1413,13 +1644,12 @@ int main(int argc, char** argv){
 		irc_destroy_session(irc_ctx);
 		timerclear(&idle_tv);
 		ping_sent = 0;
-	
+
 		if(running){
+			puts("Restarting.");
 			if(getenv("INSOBOT_NO_AUTO_RESTART")){
-				puts("Restarting when you press a key...");
+				puts("(when you press a key...)");
 				getchar();
-			} else {
-				puts("Restarting");
 			}
 			usleep(10000000L);
 		}
@@ -1466,9 +1696,8 @@ int main(int argc, char** argv){
 	}
 	sb_free(ipc_peers);
 
-	if(!getenv("INSOBOT_NO_CRAZY_TIMESTAMPS")){
-		pthread_cancel(log_thread);
-		pthread_join(log_thread, NULL);
+	if(pipe_fds[1]){
+		close(pipe_fds[1]);
 	}
 
 	return 0;

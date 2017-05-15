@@ -89,8 +89,8 @@ void inso_ht_free(inso_ht* ht){
 				free(ht->prev_memory);
 			}
 		}
+		memset(ht, 0, sizeof(*ht));
 	}
-	memset(ht, 0, sizeof(*ht));
 }
 
 void* inso_ht_put(inso_ht* ht, const void* elem){
@@ -285,7 +285,7 @@ inso_htpriv_del_i(inso_ht* ht, intptr_t idx){
 
 		INSO_HT_DBG("hash=%zu, idx2=%zu, ", hash, idx2);
 
-		if(idx2 <= idx){
+		if(idx2 <= (size_t)idx){
 			INSO_HT_DBG("swapping.");
 			memcpy(
 				ht->memory + idx  * ht->elem_size,

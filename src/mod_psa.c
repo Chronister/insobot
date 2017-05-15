@@ -16,7 +16,7 @@ static void psa_tick (time_t);
 static bool psa_save (FILE*);
 static void psa_quit (void);
 
-enum { PSA_ADD, PSA_DEL };
+enum { PSA_ADD, PSA_DEL, PSA_LIST };
 
 const IRCModuleCtx irc_mod_ctx = {
 	.name     = "psa",
@@ -28,8 +28,9 @@ const IRCModuleCtx irc_mod_ctx = {
 	.on_save  = &psa_save,
 	.on_quit  = &psa_quit,
 	.commands = DEFINE_CMDS (
-		[PSA_ADD] = CMD("psa+"),
-		[PSA_DEL] = CMD("psa-")
+		[PSA_ADD]  = CMD("psa+"),
+		[PSA_DEL]  = CMD("psa-"),
+		[PSA_LIST] = CMD("psa")
 	)
 };
 
@@ -81,7 +82,7 @@ static void psa_add(const char* chan, const char* arg, bool silent){
 		S_MSG
 	} state = S_ID;
 
-	const char* errs[] = {
+	static const char* errs[] = {
 		[-S_NO_ID] = "No psa id/name given",
 		[-S_NO_MSG] = "No message given",
 		[-S_NEGATIVE_FREQ] = "The minute frequency must be > 0",
@@ -106,7 +107,7 @@ static void psa_add(const char* chan, const char* arg, bool silent){
 	do {
 		switch(state){
 			case S_ID: {
-				if(sscanf(p, " %s%n", token, &len) == 1){
+				if(sscanf(p, " %127s%n", token, &len) == 1){
 					p += len;
 					psa.id = strdup(token);
 					state = S_MAIN;
@@ -119,7 +120,7 @@ static void psa_add(const char* chan, const char* arg, bool silent){
 				if(sscanf(p, " +%127s%n", token, &len) == 1){
 					bool got_opt = false;
 
-					for(int i = 0; i < ARRAY_SIZE(opts); ++i){
+					for(size_t i = 0; i < ARRAY_SIZE(opts); ++i){
 						if(strcmp(opts[i].name, token) == 0){
 							state = opts[i].state;
 							got_opt = true;
@@ -150,7 +151,7 @@ static void psa_add(const char* chan, const char* arg, bool silent){
 			} break;
 
 			case S_OPT_TRIGGER: {
-				if(sscanf(p, " '%127[^']'%n", token, &len) == 1 || sscanf(p, " %s%n", token, &len) == 1){
+				if(sscanf(p, " '%127[^']'%n", token, &len) == 1 || sscanf(p, " %127s%n", token, &len) == 1){
 					p += len;
 					psa.trigger = strdup(token);
 					state = S_MAIN;
@@ -237,6 +238,7 @@ static void psa_cmd(const char* chan, const char* name, const char* arg, int cmd
 
 				if(found){
 					ctx->send_msg(chan, "%s: Deleted psa '%s'", name, arg);
+					ctx->save_me();
 				} else {
 					ctx->send_msg(chan, "%s: Can't find a PSA with id '%s' for this channel.", name, arg);
 				}
@@ -244,11 +246,34 @@ static void psa_cmd(const char* chan, const char* name, const char* arg, int cmd
 				ctx->send_msg(chan, "%s: Usage: !psa- <psa_name>", name);
 			}
 		} break;
+
+		case PSA_LIST: {
+			char psa_buf[512] = "(none)";
+			char* psa_ptr = psa_buf;
+			size_t psa_sz = sizeof(psa_buf);
+
+			for(PSAData* p = psa_data; p < sb_end(psa_data); ++p){
+				if(strcmp(p->channel, chan) != 0) continue;
+
+				char tbuf[128];
+				if(p->trigger){
+					snprintf(tbuf, sizeof(tbuf), "trigger='%s'", p->trigger);
+				} else {
+					*tbuf = '\0';
+				}
+
+				snprintf_chain(&psa_ptr, &psa_sz, "[%s: %dm %s%s] ", p->id, p->freq_mins, tbuf, p->when_live ? " (when live)" : "");
+			}
+
+			ctx->send_msg(chan, "Current PSAs: %s", psa_buf);
+
+		} break;
 	};
 }
 
-static void psa_twitch_cb(intptr_t result, intptr_t arg){
+static intptr_t psa_twitch_cb(intptr_t result, intptr_t arg){
 	*(bool*)arg = result;
+	return 0;
 }
 
 static void psa_msg(const char* chan, const char* name, const char* msg){

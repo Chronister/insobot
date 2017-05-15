@@ -10,6 +10,7 @@ enum { BRAINFUCK_EXEC };
 const IRCModuleCtx irc_mod_ctx = {
 	.name     = "brainfuck",
 	.desc     = "Brainfuck interpreter",
+	.flags    = IRC_MOD_GLOBAL,
 	.on_init  = brainfuck_init,
 	.on_cmd   = &brainfuck_cmd,
 	.commands = DEFINE_CMDS (
@@ -65,7 +66,7 @@ static void brainfuck_cmd(const char* chan, const char* name, const char* arg, i
 
 			case '.': {
 				BF_DBG("out [%d]\n", *p);
-				if(out_p - output < sizeof(output) - 1){
+				if(out_p - output < isizeof(output) - 1){
 					*out_p++ = *p;
 				}
 			} break;

@@ -67,8 +67,8 @@ static int get_dow(struct tm* tm){
 }
 
 static void sched_free(void){
-	for(int i = 0; i < sb_count(sched_keys); ++i){
-		for(int j = 0; j < sb_count(sched_vals[i]); ++j){
+	for(size_t i = 0; i < sb_count(sched_keys); ++i){
+		for(size_t j = 0; j < sb_count(sched_vals[i]); ++j){
 			free(sched_vals[i][j].title);
 		}
 		sb_free(sched_vals[i]);
@@ -79,7 +79,7 @@ static void sched_free(void){
 }
 
 static int sched_get(const char* name){
-	int i;
+	size_t i;
 	for(i = 0; i < sb_count(sched_keys); ++i){
 		if(strcmp(sched_keys[i], name) == 0){
 			return i;
@@ -115,11 +115,11 @@ static void sched_offsets_update(void){
 	time_t week_start = timegm(&now_tm);
 	now -= week_start;
 
-	for(int i = 0; i < sb_count(sched_vals); ++i){
+	for(size_t i = 0; i < sb_count(sched_vals); ++i){
 		const char* user = sched_keys[i];
 		const SchedEntry* scheds = sched_vals[i];
 
-		for(int j = 0; j < sb_count(scheds); ++j){
+		for(size_t j = 0; j < sb_count(scheds); ++j){
 			const SchedEntry* s = scheds + j;
 			time_t t = s->start - week_start;
 
@@ -130,12 +130,13 @@ static void sched_offsets_update(void){
 
 			struct tm date = {};
 			gmtime_r(&s->start, &date);
-			int start_dow = get_dow(&date);
+			date.tm_year = now_tm.tm_year;
+			date.tm_mon = now_tm.tm_mon;
 
 			for(int k = 0; k < DAYS_IN_WEEK; ++k){
 				if(!(s->repeat & (1 << k))) continue;
 
-				date.tm_mday -= (start_dow - k);
+				date.tm_mday = now_tm.tm_mday + k;
 				t = timegm(&date) - week_start;
 				SchedOffset so = { t, user, s };
 				sb_push(sched_offsets, so);
@@ -199,11 +200,11 @@ static bool sched_reload(void){
 		{ (const char*[]){ "repeat", NULL }, yajl_t_number },
 	};
 
-	for(int i = 0; i < root->u.array.len; ++i){
+	for(size_t i = 0; i < root->u.array.len; ++i){
 		yajl_val vals[5];
-		for(int j = 0; j < ARRAY_SIZE(vals); ++j){
+		for(size_t j = 0; j < ARRAY_SIZE(vals); ++j){
 			vals[j] = yajl_tree_get(root->u.array.values[i], keys[j].path, keys[j].type);
-			if(!vals[j]) printf("mod_schedule: parse error %d/%d\n", i, j);
+			if(!vals[j]) printf("mod_schedule: parse error %zu/%zu\n", i, j);
 		}
 
 		SchedEntry entry = {
@@ -214,10 +215,10 @@ static bool sched_reload(void){
 		struct tm tm = {};
 
 		strptime(vals[K_START]->u.string, "%FT%TZ", &tm);
-		entry.start = mktime(&tm);
+		entry.start = timegm(&tm);
 
 		strptime(vals[K_END]->u.string, "%FT%TZ", &tm);
-		entry.end = mktime(&tm);
+		entry.end = timegm(&tm);
 
 		int diff = (entry.end - entry.start) / 60;
 		localtime_r(&entry.start, &tm);
@@ -268,8 +269,8 @@ static void sched_upload(void){
 	char time_buf[256] = {};
 
 	yajl_gen_array_open(json);
-	for(int i = 0; i < sb_count(sched_keys); ++i){
-		for(int j = 0; j < sb_count(sched_vals[i]); ++j){
+	for(size_t i = 0; i < sb_count(sched_keys); ++i){
+		for(size_t j = 0; j < sb_count(sched_vals[i]); ++j){
 			yajl_gen_map_open(json);
 
 			yajl_gen_string(json, "user", 4);
@@ -310,7 +311,7 @@ static void sched_upload(void){
 	sched_offsets_update();
 }
 
-static bool sched_parse_user(const char* in, const char* fallback, char* out, int out_len){
+static bool sched_parse_user(const char* in, const char* fallback, char* out, size_t out_len){
 	bool found = false;
 
 	if(*in == '#'){
@@ -323,7 +324,7 @@ static bool sched_parse_user(const char* in, const char* fallback, char* out, in
 		*stpncpy(out, fallback, out_len-1) = '\0';
 	}
 
-	for(int i = 0; i < out_len; ++i)
+	for(size_t i = 0; i < out_len; ++i)
 		out[i] = tolower(out[i]);
 
 	return found;
@@ -335,7 +336,7 @@ static bool sched_parse_id(const char* in, int* id_out, int* day_out){
 	int ret = sscanf(in, "%d%3s", &id, day);
 
 	if(ret == 2){
-		for(int i = 0; i < ARRAY_SIZE(days); ++i){
+		for(size_t i = 0; i < ARRAY_SIZE(days); ++i){
 			if(strcasecmp(day, days[i]) == 0){
 				day_id = i;
 				break;
@@ -343,7 +344,7 @@ static bool sched_parse_id(const char* in, int* id_out, int* day_out){
 		}
 	}
 
-	if(ret == 0){
+	if(ret == 0 || id < 0){
 		return false;
 	} else {
 		*id_out  = id;
@@ -378,7 +379,7 @@ static bool sched_parse_days(const char* _in, struct tm* date, unsigned* day_mas
 		{ "weekly"  , 1 << get_dow(date) },
 	};
 
-	for(int i = 0; i < ARRAY_SIZE(repeat_tokens); ++i){
+	for(size_t i = 0; i < ARRAY_SIZE(repeat_tokens); ++i){
 		if(strcasecmp(in, repeat_tokens[i].text) == 0){
 			*day_mask = repeat_tokens[i].repeat_val;
 			found = true;
@@ -388,11 +389,10 @@ static bool sched_parse_days(const char* _in, struct tm* date, unsigned* day_mas
 
 	// try comma separated days list
 	if(!found){
-
 		char* day_state;
 		char* day = strtok_r(in, ",", &day_state);
 		while(day){
-			for(int i = 0; i < ARRAY_SIZE(days); ++i){
+			for(size_t i = 0; i < ARRAY_SIZE(days); ++i){
 				if(strcasecmp(day, days[i]) == 0){
 					*day_mask |= (1 << i);
 					found = true;
@@ -410,7 +410,7 @@ static bool sched_parse_days(const char* _in, struct tm* date, unsigned* day_mas
 			for(int i = 0; i < 7; ++i){
 				if(*day_mask & (1 << i)){
 					date->tm_mday += (i - today);
-					mktime(date);
+					timegm(date);
 					break;
 				}
 			}
@@ -426,7 +426,7 @@ static bool sched_parse_days(const char* _in, struct tm* date, unsigned* day_mas
 		date->tm_hour = 0;
 		date->tm_min = 0;
 		date->tm_sec = 0;
-		mktime(date);
+		timegm(date);
 		return true;
 	}
 
@@ -552,7 +552,7 @@ static void sched_add(const char* chan, const char* name, const char* _arg){
 	}
 
 	if(!title){
-		sched.title = strdup("Untitled stream");
+		sched.title = strdup("Untitled Stream");
 	} else {
 		sched.title = strndup(title, sb_count(title));
 		sb_free(title);
@@ -564,7 +564,7 @@ static void sched_add(const char* chan, const char* name, const char* _arg){
 
 	ctx->send_msg(
 		chan,
-		"Added schedule for \0038%s\017's [\00311%s\017] stream \0038#%d\017:\00310 https://abaines.me.uk/insobot/schedule \017",
+		"Added schedule for \0038%s\017's [\00311%s\017] stream \0038#%zu\017:\00310 " SCHEDULE_URL " \017",
 		sched_user,
 		sched.title,
 		sb_count(sched_vals[index])-1
@@ -625,7 +625,7 @@ static void sched_edit(const char* chan, const char* name, const char* _arg){
 			return;
 		}
 		entry = sched_vals[index];
-		if(sb_count(entry) <= id){
+		if(sb_count(entry) <= (size_t)id){
 			ctx->send_msg(chan, "%s: %s doesn't have a schedule with id %d.", name, sched_user, id);
 			return;
 		}
@@ -712,11 +712,28 @@ static void sched_edit(const char* chan, const char* name, const char* _arg){
 
 	ctx->send_msg(
 		chan, 
-		"Updated \0038%s\017's [\00311%s\017] stream schedule \0038#%d\017:\00310 https://abaines.me.uk/insobot/schedule \017",
+		"Updated \0038%s\017's [\00311%s\017] stream schedule \0038#%d\017:\00310 " SCHEDULE_URL " \017",
 		sched_user,
 		entry->title,
 		id
 	);
+}
+
+static bool sched_del_i(int index, int id){
+	free(sched_vals[index][id].title);
+	sb_erase(sched_vals[index], id);
+
+	if(sb_count(sched_vals[index]) == 0){
+		free(sched_keys[index]);
+		sb_free(sched_vals[index]);
+
+		sb_erase(sched_keys, index);
+		sb_erase(sched_vals, index);
+
+		return true;
+	} else {
+		return false;
+	}
 }
 
 static void sched_del(const char* chan, const char* name, const char* _arg){
@@ -751,26 +768,17 @@ static void sched_del(const char* chan, const char* name, const char* _arg){
 		return;
 	}
 
-	if(id < 0 || id >= sb_count(sched_vals[index])){
-		ctx->send_msg(chan, "%s: %s has %d schedules. I can't delete number %d.", name, sched_user, sb_count(sched_vals[index]), id);
+	if((size_t)id >= sb_count(sched_vals[index])){
+		ctx->send_msg(chan, "%s: %s has %zu schedules. I can't delete number %d.", name, sched_user, sb_count(sched_vals[index]), id);
 		return;
 	}
 
-	free(sched_vals[index][id].title);
-	sb_erase(sched_vals[index], id);
-	if(sb_count(sched_vals[index]) == 0){
-		free(sched_keys[index]);
-		sb_free(sched_vals[index]);
-
-		sb_erase(sched_keys, index);
-		sb_erase(sched_vals, index);
-	}
-
+	sched_del_i(index, id);
 	sched_upload();
 
 	ctx->send_msg(
 		chan,
-		"%s: Deleted \0038%s\017's schedule \0038#%d\017:\00310 https://abaines.me.uk/insobot/schedule \017",
+		"%s: Deleted \0038%s\017's schedule \0038#%d\017:\00310 " SCHEDULE_URL " \017",
 		name,
 		sched_user,
 		id
@@ -790,7 +798,7 @@ static void sched_show(const char* chan, const char* name, const char* arg){
 	}
 
 	char* sched_buf = NULL;
-	for(int i = 0; i < sb_count(sched_vals[index]); ++i){
+	for(size_t i = 0; i < sb_count(sched_vals[index]); ++i){
 		if(sched_buf){
 			sb_push(sched_buf, ' ');
 		}
@@ -825,11 +833,12 @@ static void sched_show(const char* chan, const char* name, const char* arg){
 
 		int len = snprintf(
 			tmp, sizeof(tmp),
-			"[%d: %s • %s • %02d:%02d UTC]",
+			"[%zu: %s • %s • %02d:%02d UTC]",
 			i, s->title, date_str, date.tm_hour, date.tm_min
 		);
 
-		if(len >= sizeof(tmp)){
+		if(len < 0) break;
+		if(len >= isizeof(tmp)){
 			len = sizeof(tmp) - 1;
 		}
 		memcpy(sb_add(sched_buf, len), tmp, len);
@@ -917,7 +926,7 @@ static void sched_cmd(const char* chan, const char* name, const char* arg, int c
 		} break;
 
 		case SCHED_LINK: {
-			ctx->send_msg(chan, "%s: You can view all known schedules here: https://abaines.me.uk/insobot/schedule/", name);
+			ctx->send_msg(chan, "%s: You can view all known schedules here: " SCHEDULE_URL, name);
 		} break;
 
 		case SCHED_NEXT: {
@@ -939,34 +948,117 @@ static void sched_quit(void){
 }
 
 static void sched_mod_msg(const char* sender, const IRCModMsg* msg){
-	if(strcmp(msg->cmd, "sched_get") == 0){
-		const char* name = (const char*)msg->arg;
-		int index = sched_get(name);
 
-		if(index != -1){
+	// XXX: we might need to pull from the gist here...
+
+	if(strcmp(msg->cmd, "sched_iter") == 0){
+		const char* name = (const char*)msg->arg;
+		bool iter_all = true;
+		int index = 0;
+
+		if(name){
+			iter_all = false;
+			if((index = sched_get(name)) == -1){
+				return;
+			}
+		}
+
+		for(; index < sb_count(sched_keys); ++index){
 			SchedMsg result = {
 				.user = sched_keys[index],
 			};
 
-			for(int i = 0; i < sb_count(sched_keys[index]); ++i){
+			for(size_t i = 0; i < sb_count(sched_vals[index]); ++i){
+				SchedEntry* ent = sched_vals[index] + i;
 				result.sched_id = i;
-				result.start  = sched_vals[index][i].start;
-				result.end    = sched_vals[index][i].end;
-				result.title  = sched_vals[index][i].title;
-				result.repeat = sched_vals[index][i].repeat;
+				result.start  = ent->start;
+				result.end    = ent->end;
+				result.title  = ent->title;
+				result.repeat = ent->repeat;
 
-				msg->callback((intptr_t)&result, msg->cb_arg);
+				SchedIterCmd cmd = msg->callback((intptr_t)&result, msg->cb_arg);
+
+				// if the callback changed anything, save back those changes.
+
+				ent->start  = result.start;
+				ent->end    = result.end;
+				ent->repeat = result.repeat;
+
+				if(result.title != ent->title){
+					free(ent->title);
+					ent->title = (char*)result.title;
+				}
+
+				if(cmd & SCHED_ITER_DELETE){
+					if(sched_del_i(index, i)){
+						--index;
+						break;
+					}
+					--i;
+				}
+
+				if(cmd & SCHED_ITER_STOP){
+					return;
+				}
 			}
+
+			if(!iter_all) break;
 		}
 
 		return;
 	}
 
-	// TODO
-	if(strcmp(msg->cmd, "sched_set") == 0){
-		//SchedMsg* request = (SchedMsg*)msg->arg;
+	if(strcmp(msg->cmd, "sched_add") == 0){
+		SchedMsg* request = (SchedMsg*)msg->arg;
+		SchedEntry sched = {};
+
+		if(!request->user || !request->start || !request->end || request->start > request->end){
+			if(msg->callback){
+				msg->callback(false, msg->cb_arg);
+			}
+			return;
+		}
+
+		const char* title = request->title ?: "Untitled Stream";
+		char* user = strdupa(request->user);
+		for(char* c = user; *c; ++c) *c = tolower(*c);
+
+		// check if we can merge this with an existing schedule
+		int index = sched_get(user);
+		if(index != -1){
+			struct tm want = {}, have = {};
+			gmtime_r(&request->start, &want);
+
+			for(int i = 0; i < sb_count(sched_vals[index]); ++i){
+				SchedEntry* s = sched_vals[index] + i;
+				gmtime_r(&s->start, &have);
+
+				if(strcasecmp(title, s->title) == 0
+					&& s->end - s->start == request->end - request->start
+					&& want.tm_hour == have.tm_hour
+					&& want.tm_min  == have.tm_min
+					&& s->repeat){
+
+					s->repeat |= (1 << get_dow(&want));
+					return;
+				}
+			}
+		}
+
+		// otherwise, add it.
+		sched.start  = request->start;
+		sched.end    = request->end;
+		sched.repeat = request->repeat & 0x7f;
+		sched.title  = strdup(title);
+
+		index = sched_get_add(user);
+		sb_push(sched_vals[index], sched);
 
 		return;
 	}
 
+	if(strcmp(msg->cmd, "sched_save") == 0){
+		sched_upload();
+		return;
+	}
 }

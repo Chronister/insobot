@@ -86,7 +86,7 @@ static void automod_connect(const char* serv){
 static Suspect* get_suspect(const char* chan, const char* name){
 
 	int index = -1;
-	for(int i = 0; i < sb_count(channels); ++i){
+	for(size_t i = 0; i < sb_count(channels); ++i){
 		if(strcmp(chan, channels[i]) == 0){
 			index = i;
 			break;
@@ -99,7 +99,7 @@ static Suspect* get_suspect(const char* chan, const char* name){
 		index = sb_count(channels) - 1;
 	}
 
-	for(int i = 0; i < sb_count(suspects[index]); ++i){
+	for(size_t i = 0; i < sb_count(suspects[index]); ++i){
 		if(strcmp(suspects[index][i].name, name) == 0){
 			return suspects[index] + i;
 		}
@@ -116,7 +116,7 @@ static Suspect* get_suspect(const char* chan, const char* name){
 static void automod_join(const char* chan, const char* name){
 
 	if(strcmp(name, ctx->get_username()) == 0){
-		for(int i = 0; i < sb_count(channels); ++i){
+		for(size_t i = 0; i < sb_count(channels); ++i){
 			if(strcmp(channels[i], chan)) return;
 		}
 
@@ -238,12 +238,14 @@ static int am_score_ascii_art(const Suspect* s, const char* msg, size_t len){
 	return bad_char_score;
 }
 
-static void get_karma_cb(intptr_t result, intptr_t arg){
+static intptr_t get_karma_cb(intptr_t result, intptr_t arg){
 	if(result) *(int*)arg = result;
+	return 0;
 }
 
-static void get_user_cb(intptr_t result, intptr_t arg){
+static intptr_t get_user_cb(intptr_t result, intptr_t arg){
 	if(result) *(time_t*)arg = result;
+	return 0;
 }
 
 static int am_score_links(const Suspect* s, const char* msg, size_t len){
@@ -274,7 +276,7 @@ static int am_score_links(const Suspect* s, const char* msg, size_t len){
 			time_t user_created_date = 0;
 			MOD_MSG(ctx, "twitch_get_user_date", s->name, &get_user_cb, &user_created_date);
 
-			printf("twitch user time: %zd\n", (now - user_created_date));
+			printf("twitch user time: %zu\n", (size_t)(now - user_created_date));
 
 			if((now - user_created_date) < (24*60*60)){
 				return 500;

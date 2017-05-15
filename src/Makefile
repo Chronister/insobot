@@ -1,12 +1,28 @@
-CFLAGS  := -D_GNU_SOURCE -Wall -ffunction-sections -fdata-sections -Wno-pointer-sign -std=gnu99 -g -fsanitize=address
+CFLAGS  := -D_GNU_SOURCE -Wall -ffunction-sections -fdata-sections -std=gnu99 \
+ -g -Werror=implicit-function-declaration -Wno-pointer-sign -funwind-tables
 LDFLAGS := -Wl,--as-needed -Wl,--gc-sections
 
 headers  := $(wildcard *.h)
 module_c := $(wildcard mod_*.c)
-module_o = $(patsubst %.c,../modules/%.so,$(module_c))
+module_o  = $(patsubst %.c,../modules/%.so,$(module_c))
 
 common_h := $(wildcard inso_*.h)
 common_o := $(patsubst %.h,../lib/%.o,$(common_h))
+
+# Use this to only build certain modules; here is a reasonable default set.
+MODULES := admin alias chans filter haiku help imgmacro info karma linkinfo\
+ markov meta poll psa quotes twitch whitelist
+
+# You can define it (and other stuff) in src/config.mk to avoid makefile changes
+#  in git from overwriting your settings.
+# Put "undefine MODULES" in there if you want all modules (not recommended)
+-include config.mk
+
+ifdef MODULES
+    module_c := $(filter $(patsubst %,mod_%.c,$(MODULES)),$(module_c))
+endif
+
+# check for libraries
 
 lz     := $(shell pkg-config --libs zlib  2>/dev/null)
 lyajl  := $(shell pkg-config --libs yajl  2>/dev/null)
@@ -26,6 +42,10 @@ ifndef lcairo
     module_c := $(filter-out mod_imgmacro.c,$(module_c))
 endif
 
+LIBS := ../lib/inso_common.a -lcurl $(lyajl) $(lz) $(lcairo)
+
+# main rules
+
 all: ../insobot $(module_o)
 
 ../insobot: insobot.c $(headers)
@@ -34,8 +54,8 @@ all: ../insobot $(module_o)
 ../modules ../lib:
 	mkdir $@
 
-../modules/%.so: %.c ../lib/inso_common.a | $(headers) ../modules
-	$(CC) $(CFLAGS) -fPIC $^ -shared -o $@ $(LDFLAGS) -lcurl $(lyajl) $(lz) $(lcairo)
+../modules/%.so: %.c ../lib/inso_common.a $(headers) | ../modules
+	$(CC) $(CFLAGS) -fPIC $< -shared -o $@ $(LDFLAGS) $(LIBS)
 
 ../lib/inso_%.o: inso_%.h | ../lib
 	$(CC) $(CFLAGS) -x c -fPIC -DINSO_IMPL -c $^ -o $@
@@ -43,5 +63,18 @@ all: ../insobot $(module_o)
 ../lib/inso_common.a: $(common_o)
 	ar rcs $@ $^
 
+# twc stuff
+
+../modules/mod_twitter.so: ../lib/libtwc.a
+../modules/mod_twitter.so: LIBS += ../lib/libtwc.a
+../modules/mod_twitter.so: CFLAGS += -I../lib
+
+../lib/libtwc.a: ../lib/makefile.twc
+	$(MAKE) -C $(<D) -f $(<F)
+
+# misc
+
 clean:
 	$(RM) $(module_o) $(common_o) ../lib/inso_common.a ../insobot
+
+.PHONY: all clean

@@ -1,7 +1,9 @@
 #include "module.h"
 #include <curl/curl.h>
 #include <yajl/yajl_tree.h>
+#include <regex.h>
 #include "inso_utils.h"
+#include "inso_xml.h"
 #include "stb_sb.h"
 
 static void info_cmd  (const char*, const char*, const char*, int);
@@ -12,7 +14,7 @@ enum { INFO_GET };
 const IRCModuleCtx irc_mod_ctx = {
 	.name     = "info",
 	.desc     = "Gets information about stuff from the internet",
-	.flags    = IRC_MOD_DEFAULT,
+	.flags    = IRC_MOD_GLOBAL,
 	.on_cmd   = &info_cmd,
 	.on_init  = &info_init,
 	.commands = DEFINE_CMDS(
@@ -35,7 +37,7 @@ static const char* paths[][2] = {
 	[P_REDIRECT] = { "Redirect"     , NULL },
 };
 
-static char* info_trim(const char* text, size_t maxlen){
+static char* info_trim(const char* text, int maxlen){
 	const char* p = text-1;
 	int len = 0;
 
@@ -49,12 +51,52 @@ static char* info_trim(const char* text, size_t maxlen){
 	return strndup(text, len);
 }
 
-static size_t info_header_cb(char* buffer, size_t size, size_t nelem, void* arg){
-	char* loc;
-	if(buffer && sscanf(buffer, "Location: %m[^\r\n]", &loc) == 1){
-		*(char**)arg = loc;
+static void info_fallback(const char* chan, const char* arg, CURL* curl){
+	char* data = NULL;
+	char* url;
+
+	{
+		char* query = curl_easy_escape(curl, arg, 0);
+		asprintf_check(&url, "https://duckduckgo.com/html/?q=%s&kl=wt-wt&kz=-1&kaf=1&kd=-1&k1=-1&t=insobot", query);
+		curl_free(query);
 	}
-	return size * nelem;
+
+	inso_curl_reset(curl, url, &data);
+	inso_curl_perform(curl, &data);
+	free(url);
+	url = NULL;
+
+	uintptr_t* tokens = calloc(0x2000, sizeof(*tokens));
+	ixt_tokenize(data, tokens, 0x2000, 0);
+
+	char desc[512];
+	bool get_content = false;
+	*desc = 0;
+
+	for(uintptr_t* t = tokens; *t; ++t){
+		if(!get_content){
+			if(ixt_match(t, IXT_ATTR_KEY, "class", IXT_ATTR_VAL, "result__snippet", IXT_ATTR_KEY, "href", NULL) && strlen((char*)t[7]) < 80){
+				url = (char*)t[7];
+				get_content = true;
+			}
+		} else {
+			if(t[0] == IXT_CONTENT){
+				inso_strcat(desc, sizeof(desc), (char*)t[1]);
+			} else if(ixt_match(t, IXT_ATTR_VAL, "result__extras", NULL)){
+				break;
+			}
+		}
+	}
+
+	free(tokens);
+
+	if(url){
+		char* d = info_trim(desc, 175);
+		ctx->send_msg(chan, "%s %s", url, d);
+		free(d);
+	} else {
+		ctx->send_msg(chan, "Sorry, no information found for '%s'.", arg);
+	}
 }
 
 static const char* info_top_result(yajl_val results){
@@ -72,6 +114,11 @@ static void info_cmd(const char* chan, const char* nick, const char* arg, int cm
 
 	if(!*arg++){
 		ctx->send_msg(chan, "What would you like info about, %s?", nick);
+		return;
+	}
+
+	if(strcasecmp(arg, "insobot") == 0){
+		ctx->send_msg(chan, "I'm an IRC bot written in C99 by insofaras: https://github.com/baines/insobot");
 		return;
 	}
 
@@ -109,12 +156,12 @@ static void info_cmd(const char* chan, const char* nick, const char* arg, int cm
 	switch(*type->u.string){
 
 		case 0: {
-			ctx->send_msg(chan, "Sorry, I don't have any information about '%s.'", arg);
+			info_fallback(chan, arg, curl);
 		} break;
 
 		case 'D': {
 			char choices[512] = {};
-			const int limit = INSO_MIN(5, related->u.array.len);
+			const int limit = INSO_MIN(5u, related->u.array.len);
 
 			for(int i = 0; i < limit; ++i){
 				yajl_val link = yajl_tree_get(related->u.array.values[i], paths[P_FIRSTURL], yajl_t_string);
@@ -151,15 +198,15 @@ static void info_cmd(const char* chan, const char* nick, const char* arg, int cm
 				inso_curl_reset(curl, redir->u.string, &data);
 
 				curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-				curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &info_header_cb);
-				curl_easy_setopt(curl, CURLOPT_HEADERDATA, &location);
+				curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 				curl_easy_perform(curl);
 				sb_free(data);
 
+				curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &location);
+
 				if(location){
 					ctx->send_msg(chan, "%s: %s", nick, location);
-					free(location);
 				} else {
 					ctx->send_msg(chan, "%s: %s", nick, redir->u.string);
 				}
@@ -196,4 +243,3 @@ static bool info_init(const IRCCoreCtx* _ctx){
 	ctx = _ctx;
 	return true;
 }
-

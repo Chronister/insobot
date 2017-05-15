@@ -41,6 +41,7 @@ static inline const char* env_else(const char* env, const char* def){
 
 static bool chans_init(const IRCCoreCtx* _ctx){
 	ctx = _ctx;
+
 	return true;
 }
 
@@ -104,7 +105,7 @@ static void chans_cmd(const char* chan, const char* name, const char* arg, int c
 static void chans_join(const char* chan, const char* name){
 	if(strcmp(name, ctx->get_username()) != 0) return;
 
-	for(int i = 0; i < sb_count(join_list); ++i){
+	for(size_t i = 0; i < sb_count(join_list); ++i){
 		if(strcmp(join_list[i], chan) == 0){
 			free(join_list[i]);
 			sb_erase(join_list, i);
@@ -124,15 +125,36 @@ static void chans_join(const char* chan, const char* name){
 	}
 }
 
+static int chans_sort(const void* a, const void* b){
+	return strcmp(*(const char**)a, *(const char**)b);
+}
+
 static bool chans_save(FILE* file){
+	const char** list = NULL;
 	for(const char** c = ctx->get_channels(); *c; ++c){
-		fprintf(file, "%s\n", *c);
+		sb_push(list, *c);
 	}
+
+	if(sb_count(join_list)){
+		memcpy(sb_add(list, sb_count(join_list)), join_list, sb_count(join_list)*sizeof(char*));
+	}
+
+	qsort(list, sb_count(list), sizeof(char*), &chans_sort);
+
+	const char* prev = "";
+	sb_each(c, list){
+		if(strcmp(prev, *c) == 0) continue;
+		fprintf(file, "%s\n", *c);
+		prev = *c;
+	}
+
+	sb_free(list);
+
 	return true;
 }
 
 static bool chans_find(const char* chan){
-	for(int i = 0; i < sb_count(join_list); ++i){
+	for(size_t i = 0; i < sb_count(join_list); ++i){
 		if(strcasecmp(chan, join_list[i]) == 0){
 			return true;
 		}
@@ -141,6 +163,13 @@ static bool chans_find(const char* chan){
 }
 
 static void chans_connect(const char* serv){
+
+	char file_chan[256];
+	FILE* f = fopen(ctx->get_datafile(), "rb");
+	while(fscanf(f, "%255s", file_chan) == 1){
+		sb_push(join_list, strdup(file_chan));
+	}
+	fclose(f);
 
 	if(strcasecmp(serv, "irc.chat.twitch.tv") == 0 || getenv("IRC_IS_TWITCH")){
 		ctx->send_raw("CAP REQ :twitch.tv/membership");
@@ -169,17 +198,6 @@ static void chans_connect(const char* serv){
 	} while((c = strtok_r(NULL, ", ", &state)));
 
 	free(channels);
-
-	char file_chan[256];
-
-	FILE* f = fopen(ctx->get_datafile(), "rb");
-	while(fscanf(f, "%255s", file_chan) == 1){
-		if(!chans_find(file_chan)){
-			printf("mod_chans: Joining %s (file)\n", file_chan);
-			sb_push(join_list, strdup(file_chan));
-		}
-	}
-	fclose(f);
 
 	if(sb_count(join_list)){
 		char* c = sb_last(join_list);
