@@ -3,6 +3,7 @@
 #include <regex.h>
 #include <curl/curl.h>
 #include "inso_utils.h"
+#include "stb_sb.h"
 
 enum { GOOGLE, DDG, MSDN, };
 
@@ -30,7 +31,7 @@ static bool search_init(const IRCCoreCtx* _ctx){
     ctx = _ctx;
 
     bool ret = true;
-    int reg_result = regcomp(&ddg_result_regex, "[^a]>\\s+<h2 class=\"result__title\">\\s+<a rel=\"nofollow\"\\s+class=\"result__a.{1,10}href=\"([^\"]*)\"", REG_EXTENDED | REG_ICASE);
+    int reg_result = regcomp(&ddg_result_regex, "<a class=\"result__snippet\"\\s+href=\"([^\"]*)\"", REG_EXTENDED | REG_ICASE);
     if (reg_result != 0) {
         ret = false;
         char errbuf[256];
@@ -58,7 +59,7 @@ static void search_cmd(const char* chan, const char* name, const char* msg, int 
     char* ddg_url;
     char* encoded;
     CURL* tempcurl = curl_easy_init();
-    int urlres = asprintf(&ddg_url, "https://duckduckgo.com/html/?q=%s%s&no_redirect=1", 
+    int urlres = asprintf(&ddg_url, "https://duckduckgo.com/html/?q=%s%s&kl=wt-wt&kz=-1&kaf=1&kd=-1&k1=-1&t=hmd_bot", 
                          encoded = curl_easy_escape(tempcurl, msg, 0),
                          (cmd == MSDN) ? "%20site:msdn.microsoft.com" : "");
     curl_free(encoded);
@@ -103,6 +104,9 @@ static void search_cmd(const char* chan, const char* name, const char* msg, int 
             ctx->send_msg(chan, 
                           "%s: I wasn't sure how to find a result, blame ChronalDragon", name);
         }
+    } else {
+            ctx->send_msg(chan, 
+                          "%s: I wasn't sure how to find a result, blame ChronalDragon", name);
     }
     
     free(ddg_url);
